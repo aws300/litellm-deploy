@@ -1,0 +1,464 @@
+[
+  {
+    "model_id": "anthropic.claude-opus-4-7",
+    "price_input_per_mtok_usd": 5.00,
+    "price_output_per_mtok_usd": 25.00,
+    "price_batch_input_per_mtok_usd": 2.50,
+    "price_batch_output_per_mtok_usd": 12.50,
+    "cache_write_per_mtok_usd": 6.25,
+    "cache_read_per_mtok_usd": 0.50,
+    "context_window": 1000000,
+    "max_output_tokens": 128000,
+    "release_date": "2026-04-16",
+    "coding_benchmark_scores": {
+      "swe_bench_verified": 87.6,
+      "swe_bench_pro": 64.3,
+      "terminal_bench_2": 69.4
+    },
+    "strengths": "Top-of-line SWE-bench Verified (87.6%), massive 1M context, strong multi-step agentic/long-horizon coding, high-resolution image support for charts/UIs, highest benchmark scores on the list",
+    "weaknesses": "Highest price on the list; new tokenizer counts tokens 1.0-1.35x vs 4.6 so effective cost can rise up to 35%; temperature/top_p/top_k no longer supported; HumanEval/LiveCodeBench/Aider polyglot not officially published",
+    "regional_availability": "us-west-2 ONLY via cross-region inference profiles (us.anthropic.claude-opus-4-7 or global.anthropic.claude-opus-4-7); no in-region",
+    "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-4-7.html",
+    "quote": "us-west-2 supports Geo Cross-Region (us.anthropic.claude-opus-4-7) and Global Cross-Region; not available In-Region. Context 1M, max output 128K."
+  },
+  {
+    "model_id": "anthropic.claude-opus-4-7 (pricing source)",
+    "price_input_per_mtok_usd": 5.00,
+    "price_output_per_mtok_usd": 25.00,
+    "context_window": 1000000,
+    "release_date": "2026-04-16",
+    "coding_benchmark_scores": {
+      "swe_bench_verified": 87.6,
+      "swe_bench_pro": 64.3
+    },
+    "strengths": "SWE-bench Verified +6.8pt vs Opus 4.6, +11pt on SWE-bench Pro",
+    "weaknesses": "Same $5/$25 price as 4.6 but new tokenizer inflates token counts",
+    "source_url": "https://www.finout.io/blog/claude-opus-4.7-pricing-the-real-cost-story-behind-the-unchanged-price-tag",
+    "quote": "Input: $5 per 1M tokens; Output: $25 per 1M tokens; Prompt caching: up to 90% discount on cache reads; Batch processing: 50% discount on async"
+  },
+  {
+    "model_id": "anthropic.claude-opus-4-7 (benchmark source)",
+    "context_window": 1000000,
+    "coding_benchmark_scores": {
+      "swe_bench_verified": 87.6,
+      "swe_bench_pro": 64.3,
+      "gpqa": 94.2
+    },
+    "source_url": "https://www.vellum.ai/blog/claude-opus-4-7-benchmarks-explained",
+    "quote": "SWE-bench Verified jumps from 80.8% to 87.6%, a nearly 7-point gain that puts Opus 4.7 ahead of Gemini 3.1 Pro (80.6%). On SWE-bench Pro... Terminal-Bench 2.0: 69.4%"
+  },
+  {
+    "model_id": "anthropic.claude-sonnet-4-6",
+    "price_input_per_mtok_usd": 3.00,
+    "price_output_per_mtok_usd": 15.00,
+    "price_batch_input_per_mtok_usd": 1.50,
+    "price_batch_output_per_mtok_usd": 7.50,
+    "cache_write_per_mtok_usd": 3.75,
+    "cache_read_per_mtok_usd": 0.30,
+    "context_window": 1000000,
+    "max_output_tokens": 64000,
+    "release_date": "2026-02-17",
+    "coding_benchmark_scores": {
+      "swe_bench_verified": 79.6,
+      "swe_bench_verified_prompt_modified": 80.2,
+      "osworld_verified": 72.5
+    },
+    "strengths": "~Opus-level coding at 60% lower price, 1M context window (beta), +2.4pt over Sonnet 4.5 on SWE-bench Verified, very strong at autonomous long-horizon coding (Claude Code testing showed 70% preference vs 4.5)",
+    "weaknesses": "Trails Opus 4.6/4.7 on hard agentic tasks; 1M context is beta; SWE-bench Pro / LiveCodeBench specific numbers not officially published",
+    "regional_availability": "Cross-region inference required; us.anthropic.claude-sonnet-4-6 in us-west-2",
+    "source_url": "https://caylent.com/blog/claude-sonnet-4-6-in-production-capability-safety-and-cost-explained",
+    "quote": "SWE-bench Verified: 79.6% (Sonnet 4.6) vs 77.2% (Sonnet 4.5) -> +2.4 points; On SWE-bench Verified, Sonnet 4.6 is 79.6% vs Opus 4.6 at 80.8%; Batch API pricing for Sonnet 4.6 is $1.50 per million input tokens and $7.50 per million output tokens"
+  },
+  {
+    "model_id": "anthropic.claude-sonnet-4-6 (anthropic source)",
+    "price_input_per_mtok_usd": 3.00,
+    "price_output_per_mtok_usd": 15.00,
+    "context_window": 1000000,
+    "release_date": "2026-02-17",
+    "source_url": "https://www.anthropic.com/news/claude-sonnet-4-6",
+    "quote": "SWE-bench Verified: Our score was averaged over 10 trials. With a prompt modification, we saw a score of 80.2%"
+  },
+  {
+    "model_id": "anthropic.claude-haiku-4-5-20251001-v1:0",
+    "price_input_per_mtok_usd": 1.00,
+    "price_output_per_mtok_usd": 5.00,
+    "cache_write_per_mtok_usd": 1.25,
+    "cache_read_per_mtok_usd": 0.10,
+    "context_window": 200000,
+    "max_output_tokens": 64000,
+    "release_date": "2025-10-15",
+    "coding_benchmark_scores": {
+      "swe_bench_verified": 73.3,
+      "swe_bench_verified_high_reasoning": 66.6
+    },
+    "strengths": "Best cost/performance tier: 73.3% SWE-bench Verified at $1/$5 rivals frontier models from a year ago; parallelized sub-agent execution; low latency for developer tools (autocomplete, inline fix); 200K context",
+    "weaknesses": "Trails Sonnet 4.6 by ~6pt on SWE-bench; not designed for very long-horizon agent loops (vs Opus/Sonnet); cached pricing is already low so caching gains are smaller in absolute dollars",
+    "regional_availability": "us-west-2 (Oregon) in-region supported, plus cross-region via us.anthropic.claude-haiku-4-5",
+    "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-haiku-4-5.html",
+    "quote": "Context window: 200K tokens. Max output tokens: 64K. Reasoning: Supported. us-east-1 (N. Virginia), us-east-2 (Ohio), us-west-2 (Oregon)."
+  },
+  {
+    "model_id": "anthropic.claude-haiku-4-5 (anthropic)",
+    "price_input_per_mtok_usd": 1.00,
+    "price_output_per_mtok_usd": 5.00,
+    "coding_benchmark_scores": {
+      "swe_bench_verified": 73.3
+    },
+    "source_url": "https://www.anthropic.com/news/claude-haiku-4-5",
+    "quote": "Haiku 4.5 scores 73.3% on SWE-bench Verified, making it one of the world's best coding models. $1/$5 per million input and output tokens"
+  },
+  {
+    "model_id": "qwen.qwen3-coder-480b-a35b-v1:0",
+    "price_input_per_mtok_usd": 0.22,
+    "price_output_per_mtok_usd": 1.80,
+    "context_window": 262144,
+    "max_output_tokens": 65536,
+    "release_date": "2025-07-22",
+    "parameters": "480B total, 35B active (MoE, 160 experts, 8 active)",
+    "coding_benchmark_scores": {
+      "swe_bench_verified_500_turns": 69.6,
+      "swe_bench_verified_100_turns": 67.0,
+      "terminal_bench": 37.5,
+      "swe_bench_bash_only": 55.4,
+      "webdev_arena": 1285
+    },
+    "strengths": "Best open-weight agentic coder of mid-2025; strong tool-use and multi-turn; available in us-west-2 since September 2025; very cheap ($0.22/$1.80) vs Claude; 256K context",
+    "weaknesses": "Benchmarks are roughly 18pt below Claude Opus 4.7 on SWE-bench Verified; knowledge cutoff April 2024; behind newer GLM-5 / MiniMax M2.5 / Kimi K2.5 on 2026 leaderboards",
+    "regional_availability": "us-west-2 (Oregon), ap-south-1 (Mumbai), ap-northeast-1 (Tokyo), eu-west-2 (London), eu-north-1 (Stockholm); fully managed",
+    "source_url": "https://aws.amazon.com/about-aws/whats-new/2025/09/qwen3-models-fully-managed-amazon-bedrock/",
+    "quote": "Qwen Coder-480B is available today in the US West (Oregon), Asia Pacific (Mumbai, Tokyo), and Europe (London, Stockholm) AWS Regions"
+  },
+  {
+    "model_id": "qwen.qwen3-coder-480b-a35b-v1:0 (pricing)",
+    "price_input_per_mtok_usd": 0.22,
+    "price_output_per_mtok_usd": 1.80,
+    "context_window": 131072,
+    "source_url": "https://www.getmaxim.ai/bifrost/llm-cost-calculator/provider/bedrock/model/qwen.qwen3-coder-480b-a35b-v1-0",
+    "quote": "Input: $0.22 per 1M tokens, Output: $1.80 per 1M tokens; Context Window: 131,072 tokens; Max Output: 65,536 tokens"
+  },
+  {
+    "model_id": "qwen.qwen3-coder-480b-a35b-v1:0 (benchmark)",
+    "coding_benchmark_scores": {
+      "swe_bench_verified_500_turns": 69.6,
+      "swe_bench_verified_100_turns": 67.0,
+      "terminal_bench": 37.5
+    },
+    "source_url": "https://www.together.ai/models/qwen3-coder-480b-a35b-instruct",
+    "quote": "State-of-the-art SWE-bench Verified results at 69.6%, comparable to Claude Sonnet 4; scores 37.5 on terminal bench"
+  },
+  {
+    "model_id": "qwen.qwen3-coder-30b-a3b-v1:0",
+    "price_input_per_mtok_usd": 0.1545,
+    "price_output_per_mtok_usd": 0.6180,
+    "context_window": 262144,
+    "max_output_tokens": 131072,
+    "release_date": "2025-07-31",
+    "parameters": "30B total, 3B active (MoE)",
+    "coding_benchmark_scores": {
+      "swe_bench_verified_openhands_100_turns": 51.6,
+      "aider_polyglot": "significantly below 480B variant (reported gap)"
+    },
+    "strengths": "Cheapest Qwen coder on Bedrock ($0.15/$0.62); 262K context; good tool-use for size; suitable for local/edge-like workloads and parallel sub-agents; available in us-west-2",
+    "weaknesses": "Sub-frontier coding accuracy (~51-55% SWE-bench Verified); meaningful gap vs 480B on Aider-polyglot and SWE multilingual; weaker single-shot coding vs GLM-4.7-Flash (similar size)",
+    "regional_availability": "us-west-2 available (from AWS Bedrock pricing page showing Qwen3 Coder 30B A3B US tier)",
+    "source_url": "https://aws.amazon.com/bedrock/pricing/",
+    "quote": "Qwen3 Coder 30B A3B, $0.1545 input, $0.6180 output per 1M tokens"
+  },
+  {
+    "model_id": "qwen.qwen3-coder-30b-a3b-v1:0 (context)",
+    "context_window": 262144,
+    "max_output_tokens": 131072,
+    "source_url": "https://cloudprice.net/models/qwen.qwen3-coder-30b-a3b-v1%3A0",
+    "quote": "Qwen3 Coder 30B A3b V1 is a text model from AWS Bedrock with a context window of 262K tokens and max output of 131K tokens. Pricing starts at 0.15 per million"
+  },
+  {
+    "model_id": "mistral.devstral-2-123b",
+    "price_input_per_mtok_usd": 0.40,
+    "price_output_per_mtok_usd": 2.00,
+    "context_window": 256000,
+    "max_output_tokens": 8192,
+    "release_date": "2025-12-09",
+    "parameters": "123B dense transformer",
+    "coding_benchmark_scores": {
+      "swe_bench_verified": 72.2,
+      "swe_bench_multilingual": 61.3,
+      "terminal_bench_2": 40.5
+    },
+    "strengths": "Dense (non-MoE) 123B with strong 72.2% SWE-bench Verified; 256K context; Modified MIT license; Mistral Vibe CLI integration; priced at $0.40/$2.00 makes it one of the best price/SWE-bench ratios",
+    "weaknesses": "Max output only 8K (restrictive for long code generation); trails top MoE models (GLM-5, Kimi K2.5, MiniMax M2.5) on SWE-bench by 5-8pt; reddit reports suggest real-world agent performance (37.6%) well below leaderboard (72.2%)",
+    "regional_availability": "Bedrock US-region pricing $0.40/$2.00 (per AWS pricing page, referenced by multiple sources)",
+    "source_url": "https://cloudprice.net/models/amazon_bedrock/mistral.devstral-2-123b",
+    "quote": "Mistral AI's language model with a 256K context window and up to 8K output tokens, starting at $0.400 / 1M input and $2.00 / 1M output. A 123B-parameter dense transformer"
+  },
+  {
+    "model_id": "mistral.devstral-2-123b (mistral)",
+    "coding_benchmark_scores": {
+      "swe_bench_verified": 72.2,
+      "swe_bench_multilingual": 61.3,
+      "terminal_bench_2": 40.5
+    },
+    "source_url": "https://mistral.ai/news/devstral-2-vibe-cli",
+    "quote": "Devstral 2 is a 123B-parameter dense transformer supporting a 256K context window. It reaches 72.2% on SWE-bench Verified"
+  },
+  {
+    "model_id": "moonshotai.kimi-k2.5",
+    "price_input_per_mtok_usd": 0.60,
+    "price_output_per_mtok_usd": 3.00,
+    "cache_write_per_mtok_usd": 0.60,
+    "context_window": 262144,
+    "max_output_tokens": 16384,
+    "release_date": "2026-01-27",
+    "parameters": "1T total, 32B active (MoE, 384 experts, 8 active, 61 layers)",
+    "coding_benchmark_scores": {
+      "swe_bench_verified": 76.8,
+      "swe_bench_verified_non_thinking": 80.0,
+      "swe_bench_pro": 50.7,
+      "swe_bench_multilingual": 73.0,
+      "terminal_bench_2": 50.8,
+      "livecodebench_v6": 85.0
+    },
+    "strengths": "Leading open-source coding model; 85.0% LiveCodeBench v6 is class-leading; 76.8% SWE-bench Verified matches frontier; strongest open-model visual coding quality; Kimi Code CLI integration; in-region us-west-2",
+    "weaknesses": "Does NOT support cross-region inference on Bedrock (only in-region) which caps throughput/region failover; AWS Bedrock model card lists context as only 128K vs 256K advertised by Moonshot; max output 16K; the non-thinking 80.0% number requires agent scaffold",
+    "regional_availability": "us-west-2 (Oregon) and us-east-1 (N. Virginia) in-region only; no geo/global cross-region support on Bedrock",
+    "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-moonshot-ai-kimi-k2-5.html",
+    "quote": "Kimi K2.5 does not support cross-region inference. Only In-Region inference is available. Context window: 128K tokens. Max output tokens: 16K. (us-west-2: In-Region Yes)"
+  },
+  {
+    "model_id": "moonshotai.kimi-k2.5 (pricing)",
+    "price_input_per_mtok_usd": 0.60,
+    "price_output_per_mtok_usd": 3.00,
+    "source_url": "https://www.requesty.ai/models/bedrock/kimi-k2-5-us-west-2",
+    "quote": "kimi-k2.5 on AWS. Pricing per 1M tokens. Input $0.60. Output $3.00. Cache write $0.60. Region us-west-2"
+  },
+  {
+    "model_id": "moonshotai.kimi-k2.5 (benchmarks)",
+    "coding_benchmark_scores": {
+      "swe_bench_verified_thinking": 76.8,
+      "swe_bench_verified_non_thinking": 80.0,
+      "swe_bench_pro_thinking": 50.7,
+      "swe_bench_pro_non_thinking": 55.6,
+      "swe_bench_multilingual_thinking": 73.0,
+      "terminal_bench_2": 50.8,
+      "livecodebench_v6": 85.0
+    },
+    "source_url": "https://github.com/MoonshotAI/Kimi-K2.5",
+    "quote": "SWE-Bench Verified 76.8 / 80.0 (thinking / non-thinking); SWE-Bench Pro 50.7 / 55.6; SWE-Bench Multilingual 73.0 / 72.0; LiveCodeBench v6: 85.0"
+  },
+  {
+    "model_id": "deepseek.v3.2",
+    "price_input_per_mtok_usd": 0.62,
+    "price_output_per_mtok_usd": 1.85,
+    "context_window": 163840,
+    "max_output_tokens": 81920,
+    "release_date": "2025-11-17",
+    "parameters": "671B total MoE (DeepSeek Sparse Attention)",
+    "coding_benchmark_scores": {
+      "swe_bench_verified": 67.8,
+      "swe_bench_verified_high_reasoning": 70.0,
+      "swe_bench_verified_thinking_variant": 73.1,
+      "swe_bench_multilingual": 57.9,
+      "terminal_bench": 37.7,
+      "livecodebench": 74.1,
+      "aider_polyglot": 74.5
+    },
+    "strengths": "Only major coding model on this list with published Aider-Polyglot (74.5%) and LiveCodeBench (74.1%); DeepSeek Sparse Attention = strong efficiency on long context; 164K context on Bedrock; good code-review/long-context workloads; cheap at $0.62/$1.85",
+    "weaknesses": "Terminal-Bench only 37.7 (weak on agentic tool use); falls behind Kimi K2.5 / GLM-5 / MiniMax M2.5 on SWE-bench Verified; context window on Bedrock (164K) is lower than many alternatives",
+    "regional_availability": "US East (N. Virginia), US East (Ohio), US West (Oregon); cross-region inference required per AWS docs",
+    "source_url": "https://calculator.holori.com/llm/bedrock/bedrock%2Fus-west-2%2Fdeepseek.v3.2",
+    "quote": "Us West 2/deepseek.v3.2 is a standard reasoning model from Bedrock with a 164K token context window, starting at $0.620/M input and $1.85/M output tokens"
+  },
+  {
+    "model_id": "deepseek.v3.2 (benchmarks)",
+    "coding_benchmark_scores": {
+      "swe_bench_verified": 67.8,
+      "swe_bench_multilingual": 57.9,
+      "terminal_bench": 37.7,
+      "livecodebench": 74.1,
+      "aider_polyglot": 74.5
+    },
+    "source_url": "https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp",
+    "quote": "SWE Verified 67.8/67.8; SWE-bench Multilingual 57.9; Terminal-bench 37.7; LiveCodeBench 74.1; Aider-Polyglot 74.5"
+  },
+  {
+    "model_id": "zai.glm-5",
+    "price_input_per_mtok_usd": 1.00,
+    "price_output_per_mtok_usd": 3.20,
+    "context_window": 200000,
+    "max_output_tokens": 128000,
+    "release_date": "2026-02-12",
+    "parameters": "745B MoE",
+    "coding_benchmark_scores": {
+      "swe_bench_verified": 77.8,
+      "swe_bench_verified_high_reasoning": 72.8,
+      "swe_bench_multilingual": 73.3,
+      "terminal_bench_2": 56.2
+    },
+    "strengths": "Leading open-weight 2026 model: 77.8% SWE-bench Verified (tops Gemini 3.0 Pro per Z.ai); strong agentic/long-horizon design (CC-Bench-V2, Vending-Bench 2); 200K context, 128K output; published March 2026 on AWS Bedrock",
+    "weaknesses": "In-region only on Bedrock (no geo/global cross-region) which limits throughput/failover; published output limit on Bedrock (128K) is high but can balloon cost; less mature CLI/tool ecosystem than Anthropic",
+    "regional_availability": "us-west-2 (Oregon) in-region; NO geo or global cross-region inference; quota lower than Claude models",
+    "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-zai-glm-5.html",
+    "quote": "Model ID zai.glm-5. Context Window 200K tokens. Max Output 128K. us-west-2 In-Region Yes. Geo Cross-Region No. Global Cross-Region No"
+  },
+  {
+    "model_id": "zai.glm-5 (pricing/benchmarks)",
+    "price_input_per_mtok_usd": 1.00,
+    "price_output_per_mtok_usd": 3.20,
+    "coding_benchmark_scores": {
+      "swe_bench_verified": 77.8,
+      "swe_bench_multilingual": 73.3,
+      "terminal_bench_2": 56.2
+    },
+    "source_url": "https://z.ai/blog/glm-5",
+    "quote": "GLM-5: SWE-bench Verified 77.8; SWE-bench Multilingual 73.3; Terminal-Bench 2.0 56.2. Pricing: $1.0/M input, $3.2/M output (via SiliconFlow - matches Z.ai)"
+  },
+  {
+    "model_id": "zai.glm-5 (aws announcement)",
+    "release_date": "2026-03-18",
+    "source_url": "https://aws.amazon.com/about-aws/whats-new/2026/03/amazon-bedrock-minimax-glm/",
+    "quote": "MiniMax M2.5 and GLM 5 are now available in Amazon Bedrock across select AWS Regions. (announced March 18, 2026)"
+  },
+  {
+    "model_id": "zai.glm-4.7-flash",
+    "price_input_per_mtok_usd": 0.07,
+    "price_output_per_mtok_usd": 0.40,
+    "context_window": 131072,
+    "max_output_tokens": 131072,
+    "release_date": "2026-01",
+    "parameters": "30B-A3B MoE (3B active)",
+    "coding_benchmark_scores": {
+      "swe_bench_verified": 59.2,
+      "terminal_bench_2": 38.8,
+      "livecodebench_v6": 64.0,
+      "humaneval": 14.4
+    },
+    "strengths": "Cheapest model on the list at $0.07/$0.40; 59.2% SWE-bench Verified is exceptional for 30B class (2.7x Qwen3-Coder-30B's 22.0); strong τ²-Bench (79.5); free open weights (MIT); fast with MTP speculative decoding",
+    "weaknesses": "Coding is still well behind frontier (-28pt vs Opus 4.7); HumanEval score oddly low (14.4) suggests unique failure mode on that benchmark; ZAI docs list pricing - AWS Bedrock integration is relatively new",
+    "regional_availability": "Available on Bedrock per Feb 2026 AWS release note (us-east-1 and us-west-2 listed)",
+    "source_url": "https://huggingface.co/zai-org/GLM-4.7-Flash",
+    "quote": "GLM-4.7-Flash 30B-A3B MoE. SWE-bench Verified 59.2 (vs Qwen3-30B-A3B 22.0). LiveCodeBench v6 64.0. HumanEval 14.4. τ²-Bench 79.5. Context 131,072 tokens. License MIT."
+  },
+  {
+    "model_id": "zai.glm-4.7-flash (pricing)",
+    "price_input_per_mtok_usd": 0.07,
+    "price_output_per_mtok_usd": 0.40,
+    "source_url": "https://llm-stats.com/models/glm-4.7-flash",
+    "quote": "GLM-4.7-Flash costs $0.07 per million input tokens and $0.40 per million output tokens"
+  },
+  {
+    "model_id": "zai.glm-4.7-flash (bedrock availability)",
+    "release_date": "2026-02",
+    "source_url": "https://dev.to/aws-builders/aws-silently-releases-kimi-k25-and-glm-47-models-to-bedrock-1514",
+    "quote": "AWS Silently Releases Kimi K2.5 and GLM 4.7 Models to Bedrock (Feb 8, 2026). Availability: us-east-1, us-west-2 (and expanding)"
+  },
+  {
+    "model_id": "minimax.minimax-m2.5",
+    "price_input_per_mtok_usd": 0.30,
+    "price_output_per_mtok_usd": 1.20,
+    "context_window": 204800,
+    "max_output_tokens": 98304,
+    "release_date": "2026-02-12",
+    "parameters": "230B (public reports)",
+    "coding_benchmark_scores": {
+      "swe_bench_verified": 80.2,
+      "swe_bench_verified_droid": 79.7,
+      "swe_bench_verified_opencode": 76.1,
+      "swe_bench_verified_high_reasoning": 75.8,
+      "multi_swe_bench": 51.3,
+      "swe_bench_pro": 55.4,
+      "browsecomp": 76.3,
+      "bfcl_multiturn": 76.8
+    },
+    "strengths": "Best price/SWE-bench ratio on list: 80.2% SWE-bench Verified at $0.30/$1.20 (matches Opus 4.6 at ~1/10th the price); excellent Multi-SWE-bench for multi-file; strong tool-calling (BFCL 76.8%); 197K context on Bedrock",
+    "weaknesses": "Some HN commentary questions real-world parity with Sonnet 4.5; LiveCodeBench/Aider polyglot/HumanEval not published; multiple variants (M2.5 standard vs M2.5-Lightning) with different latency/price trade-offs",
+    "regional_availability": "AWS Bedrock announced March 18, 2026; us-east-1 and us-west-2 (standard tier)",
+    "source_url": "https://aws.amazon.com/bedrock/pricing/",
+    "quote": "Minimax M2, $0.30, $1.20. Minimax M2.1, $0.30, $1.20. MiniMax M2.5, $0.30, $1.20 per 1M tokens"
+  },
+  {
+    "model_id": "minimax.minimax-m2.5 (benchmarks)",
+    "coding_benchmark_scores": {
+      "swe_bench_verified": 80.2,
+      "multi_swe_bench": 51.3,
+      "swe_bench_pro": 55.4
+    },
+    "source_url": "https://www.digitalapplied.com/blog/minimax-m25-ai-model-coding-benchmarks-guide",
+    "quote": "80.2% SWE-Bench Verified: State-of-the-art coding performance with 51.3% Multi-SWE-Bench and 55.4% SWE-Bench Pro scores; 1/10th Competitor Cost"
+  },
+  {
+    "model_id": "minimax.minimax-m2.5 (bedrock ctx)",
+    "context_window": 204800,
+    "max_output_tokens": 98304,
+    "source_url": "https://custom.typingmind.com/tools/estimate-llm-usage-costs/amazon-bedrock/minimax-minimax-m2-5",
+    "quote": "MiniMax M2.5 is a minimax-family model by Amazon Bedrock with a 197k token context window and up to 98k output tokens. It is priced at $0.3000/1M"
+  },
+  {
+    "model_id": "cohere.embed-v4:0",
+    "price_input_per_mtok_usd": 0.12,
+    "price_output_per_mtok_usd": 0.00,
+    "context_window": 128000,
+    "release_date": "2025 (GA via Bedrock)",
+    "coding_benchmark_scores": {
+      "note": "Not a generative coding model; used for RAG over codebases / semantic code search. Benchmarks are MTEB/retrieval, not SWE-bench."
+    },
+    "strengths": "Multimodal embeddings (text + images interleaved); 128K context is very high for an embedder (good for whole-file / whole-PR RAG); flat $0.12/MTok; global cross-region inference available",
+    "weaknesses": "Not a coding generation model - cannot be compared on SWE-bench, HumanEval, Aider; no in-region support in us-west-2 (Geo/Global only); dimensions/batch size not documented on Bedrock model card",
+    "regional_availability": "us-west-2: Geo (US) and Global cross-region inference only; NOT in-region. IDs: us.cohere.embed-v4:0, global.cohere.embed-v4:0",
+    "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-cohere-embed-v4.html",
+    "quote": "Cohere Embed v4 is a unified multimodal embedding model. Context window: 128K tokens. us-west-2: In-Region No, Geo Yes, Global Yes"
+  },
+  {
+    "model_id": "cohere.embed-v4:0 (pricing)",
+    "price_input_per_mtok_usd": 0.12,
+    "source_url": "https://www.getmaxim.ai/bifrost/llm-cost-calculator/provider/bedrock/model/cohere.embed-v4-0",
+    "quote": "cohere.embed-v4:0 from AWS Bedrock for Embedding workloads. Input: $0.12 per 1M tokens, Output: $0.00 per 1M tokens"
+  },
+  {
+    "model_id": "SWE-bench Leaderboard snapshot (cross-model gotcha)",
+    "coding_benchmark_scores": {
+      "claude_opus_4_6": 75.6,
+      "claude_opus_4_5_high_reasoning": 76.8,
+      "gpt_5_2_codex": 72.8,
+      "glm_5_high_reasoning": 72.8,
+      "minimax_m2_5_high_reasoning": 75.8,
+      "kimi_k2_5_high_reasoning": 70.8,
+      "deepseek_v3_2_high_reasoning": 70.0,
+      "gemini_3_pro": 69.6,
+      "claude_haiku_4_5_high_reasoning": 66.6
+    },
+    "strengths": "Authoritative third-party replication using mini-SWE-agent scaffold (100 LOC). Removes vendor harness variance.",
+    "weaknesses": "Vendor-reported SWE-bench numbers (e.g., Opus 4.7 87.6%, MiniMax 80.2%) are typically 5-12pt higher than mini-SWE-agent due to harness differences; for apples-to-apples use the leaderboard numbers",
+    "source_url": "https://www.swebench.com/",
+    "quote": "MiniMax M2.5 (high reasoning) 75.80; Claude Opus 4.6 75.60; GPT-5-2 Codex 72.80; GLM-5 (high reasoning) 72.80; Kimi K2.5 (high reasoning) 70.80; DeepSeek V3.2 (high reasoning) 70.00; Claude 4.5 Haiku (high reasoning) 66.60"
+  },
+  {
+    "model_id": "GOTCHA: Claude Opus 4.7 tokenizer",
+    "strengths": "Same nominal $5/$25 price as 4.6",
+    "weaknesses": "New tokenizer counts 1.0x-1.35x more tokens for identical input text, so effective cost can rise ~35%. Budget accordingly when migrating from 4.6.",
+    "source_url": "https://www.finout.io/blog/claude-opus-4.7-pricing-the-real-cost-story-behind-the-unchanged-price-tag",
+    "quote": "Claude Opus 4.7 keeps Anthropic's $5/$25 per million token pricing, but a new tokenizer can raise effective costs by up to 35%"
+  },
+  {
+    "model_id": "GOTCHA: Opus 4.7 regional availability",
+    "weaknesses": "Opus 4.7 has no in-region support in us-west-2 - it REQUIRES cross-region inference (us.anthropic.claude-opus-4-7 or global.anthropic.claude-opus-4-7). Data-residency-strict customers must accept cross-region routing or pick a different model.",
+    "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-4-7.html",
+    "quote": "us-west-2: In-Region No. Geo Cross-Region Yes (us.anthropic.claude-opus-4-7). Global Cross-Region Yes"
+  },
+  {
+    "model_id": "GOTCHA: Kimi K2.5 / GLM-5 no cross-region",
+    "weaknesses": "Kimi K2.5 and GLM-5 DO NOT support Bedrock cross-region inference (in-region only). You cannot use us.moonshotai.kimi-k2.5 or global.zai.glm-5 - traffic must stay in us-west-2 (or us-east-1). Limits throughput scaling and cross-region failover compared to Claude models.",
+    "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-moonshot-ai-kimi-k2-5.html",
+    "quote": "Kimi K2.5 does not support cross-region inference. Only In-Region inference is available. Geo inference ID: Not supported. Global inference ID: Not supported"
+  },
+  {
+    "model_id": "GOTCHA: Parameters dropped for Opus 4.7",
+    "weaknesses": "Opus 4.7 no longer supports temperature, top_p, or top_k sampling parameters (reasoning model). Existing LiteLLM/Bedrock configs that pin these will fail or be silently ignored.",
+    "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-4-7.html",
+    "quote": "Note: Temperature, top_p, and top_k parameters are no longer supported in Claude Opus 4.7"
+  },
+  {
+    "model_id": "GOTCHA: Devstral 2 max output 8K",
+    "weaknesses": "Mistral Devstral 2 123B on Bedrock has a max_output_tokens of only 8,192 - very restrictive for long refactor/generation workloads. Compare to 64K+ for Claude/Qwen/Kimi/GLM-5.",
+    "source_url": "https://cloudprice.net/models/amazon_bedrock/mistral.devstral-2-123b",
+    "quote": "Mistral AI's language model with a 256K context window and up to 8K output tokens"
+  }
+]

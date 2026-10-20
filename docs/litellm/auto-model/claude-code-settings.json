@@ -1,0 +1,35 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://litellm.example.com",
+    "ANTHROPIC_API_KEY": "sk-REPLACE_WITH_YOUR_LITELLM_VIRTUAL_KEY",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-7",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "Opus 4.7 (LiteLLM)",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION": "Anthropic Opus 4.7 via LiteLLM -> Bedrock global inference profile",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES": "effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "Sonnet 4.6 (LiteLLM)",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION": "Anthropic Sonnet 4.6 via LiteLLM -> Bedrock global inference profile",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES": "effort,max_effort,thinking,adaptive_thinking,interleaved_thinking",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5-20251001",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": "Haiku 4.5 (LiteLLM)",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION": "Anthropic Haiku 4.5 via LiteLLM -> Bedrock global inference profile",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION": "auto",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Auto (semantic router)",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "LiteLLM semantic router: routes by embedding similarity across Haiku / Qwen-Coder / Sonnet 4.6 / Opus 4.7"
+  },
+  "availableModels": [
+    "default",
+    "auto",
+    "opus",
+    "sonnet",
+    "haiku",
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
+    "kimi-k2.5",
+    "zai.glm-5",
+    "deepseek-v3.2",
+    "qwen3-coder-480b",
+    "bedrock/us.deepseek.r1-v1:0"
+  ]
+}

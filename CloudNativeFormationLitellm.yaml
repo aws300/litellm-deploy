@@ -1,0 +1,4140 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudNativeFormation - One-click cloud-native infrastructure stack.
+  Creates VPC(IPv6), EKS(Auto Mode), EnvoyGateway, Cognito OIDC,
+  CloudFront, Global Accelerator, IRSA test pod.
+  Region: ap-northeast-2 validated. Upload this single file to deploy.
+
+# ==============================================================================
+# METADATA - Console parameter grouping
+# ==============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Stack Identity"
+        Parameters:
+          - ProjectName
+          - EnvironmentId
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCidr
+      - Label:
+          default: "EKS Configuration"
+        Parameters:
+          - EksVersion
+      - Label:
+          default: "EnvoyGateway"
+        Parameters:
+          - EnvoyGatewayVersion
+      - Label:
+          default: "App Settings"
+        Parameters:
+          - AppRootPath
+      - Label:
+          default: "Resource Tags"
+        Parameters:
+          - Tags
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name Prefix"
+      EnvironmentId:
+        default: "Unique Environment ID (e.g. 001)"
+      VpcCidr:
+        default: "VPC IPv4 CIDR"
+      EksVersion:
+        default: "Kubernetes Version"
+      EnvoyGatewayVersion:
+        default: "EnvoyGateway Version"
+      AppRootPath:
+        default: "App Root Path"
+      Tags:
+        default: "Resource Tags (JSON)"
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Description: "Project name prefix for all resources (e.g. CloudNativeFormation, ProjectCNF)"
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9]{0,19}$"
+    ConstraintDescription: "Must start with a letter, 1-20 alphanumeric characters"
+    Default: "CloudNativeFormation"
+  EnvironmentId:
+    Type: String
+    Description: "Unique identifier appended to all resource names (e.g. 001, dev, prod)"
+    AllowedPattern: "^[a-zA-Z0-9]{1,12}$"
+    ConstraintDescription: "1-12 alphanumeric characters only"
+    Default: "001"
+  VpcCidr:
+    Type: String
+    Description: "VPC IPv4 CIDR block (/16)"
+    Default: "10.80.0.0/16"
+    AllowedPattern: '^[0-9]+\.[0-9]+\.[0-9]+\.0\/16$'
+  EksVersion:
+    Type: String
+    Description: "EKS Kubernetes version"
+    Default: "1.35"
+    AllowedValues: ["1.33", "1.34", "1.35"]
+  EnvoyGatewayVersion:
+    Type: String
+    Description: "EnvoyGateway release version"
+    Default: "v1.7.1"
+  AppRootPath:
+    Type: String
+    Description: "Root path for the scaffolding app (e.g. /app)"
+    Default: "/app"
+  AdminRoleArn:
+    Type: String
+    Description: "IAM Role ARN for EKS console admin access (e.g. arn:aws:iam::123456789012:role/admin)"
+    Default: ""
+  Tags:
+    Type: String
+    Description: 'JSON object of tags to apply to all resources (e.g. {"Environment":"prod","Team":"platform"})'
+    Default: "{}"
+Conditions:
+  HasAdminRole: !Not [!Equals [!Ref AdminRoleArn, ""]]
+
+# ==============================================================================
+# MAPPINGS
+# ==============================================================================
+Mappings:
+  BedrockConfig:
+    us-west-2:
+      WildcardRegion: us-west-2
+    us-east-1:
+      WildcardRegion: us-east-1
+    ap-southeast-1:
+      WildcardRegion: us-west-2
+    ap-northeast-1:
+      WildcardRegion: us-west-2
+    ap-northeast-3:
+      WildcardRegion: us-west-2
+    eu-west-1:
+      WildcardRegion: us-west-2
+    eu-central-1:
+      WildcardRegion: us-west-2
+  SubnetConfig:
+    PublicA:
+      CidrSuffix: "0.0/20"
+      AZ: 0
+      Ipv6Index: 0
+    PublicB:
+      CidrSuffix: "16.0/20"
+      AZ: 1
+      Ipv6Index: 1
+    PublicC:
+      CidrSuffix: "32.0/20"
+      AZ: 2
+      Ipv6Index: 2
+    PrivateA:
+      CidrSuffix: "128.0/20"
+      AZ: 0
+      Ipv6Index: 3
+    PrivateB:
+      CidrSuffix: "144.0/20"
+      AZ: 1
+      Ipv6Index: 4
+    PrivateC:
+      CidrSuffix: "160.0/20"
+      AZ: 2
+      Ipv6Index: 5
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+
+  # ============================================================================
+  # SECTION 0: PRE-FLIGHT QUOTA & CONFLICT CHECK
+  # Runs before any infrastructure is created. Fails immediately if AWS service
+  # quotas are insufficient or if a deployment with the same ProjectName +
+  # EnvironmentId already exists, preventing partial or conflicting stacks.
+  # Checks: EIP, VPC, NAT Gateway/AZ, m8g availability, vCPU quota, EKS/IAM/Lambda/Cognito
+  # naming conflicts.
+  # ============================================================================
+
+  QuotaCheckRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: QuotaCheckPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeAddresses
+                  - ec2:DescribeAccountAttributes
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeNatGateways
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeInstanceTypeOfferings
+                  - eks:DescribeCluster
+                  - iam:GetRole
+                  - lambda:GetFunction
+                  - cognito-idp:DescribeUserPoolDomain
+                  - sts:GetCallerIdentity
+                  - servicequotas:GetServiceQuota
+                  - elasticfilesystem:CreateMountTarget
+                  - elasticfilesystem:DeleteMountTarget
+                  - elasticfilesystem:DescribeMountTargets
+                  - elasticfilesystem:DescribeFileSystems
+                  # EFS CreateMountTarget internally creates an ENI in the subnet
+                  # using the caller's credentials, so the role needs ENI permissions.
+                  # See https://docs.aws.amazon.com/efs/latest/ug/access-control-managing-permissions.html
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeNetworkInterfaceAttribute
+                  - ec2:DeleteNetworkInterface
+                  - ec2:ModifyNetworkInterfaceAttribute
+                  - ec2:DescribeSecurityGroups
+                Resource: "*"
+
+  QuotaCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt QuotaCheckRole.Arn
+      Timeout: 120
+      Code:
+        ZipFile: |
+          import boto3, json, logging, time, urllib.request
+          L=logging.getLogger();L.setLevel(logging.INFO)
+          def handler(event, context):
+            def send(status, data={}, reason=''):
+              body = json.dumps({
+                'Status': status,
+                'Reason': reason or context.log_stream_name,
+                'PhysicalResourceId': event.get('PhysicalResourceId', context.log_stream_name),
+                'StackId': event['StackId'],
+                'RequestId': event['RequestId'],
+                'LogicalResourceId': event['LogicalResourceId'],
+                'Data': data,
+              }).encode()
+              req = urllib.request.Request(
+                event['ResponseURL'], data=body,
+                headers={'Content-Type': '', 'Content-Length': len(body)}, method='PUT')
+              urllib.request.urlopen(req)
+            lid = event['LogicalResourceId']
+            rt = event['RequestType']
+            p = event['ResourceProperties']
+            region = p.get('Region', boto3.session.Session().region_name)
+
+            # --- EfsMountTargets handler ---
+            if lid == 'EfsMountTargets':
+              efs = boto3.client('efs', region_name=region)
+              fsid = p['FileSystemId']
+              if rt == 'Delete':
+                try:
+                  for mt in efs.describe_mount_targets(FileSystemId=fsid)['MountTargets']:
+                    efs.delete_mount_target(MountTargetId=mt['MountTargetId'])
+                  L.info("Deleted all mount targets")
+                except Exception as e:
+                  L.warning(f"Delete cleanup: {e}")
+                return send('SUCCESS')
+              # Create/Update: ensure mount targets exist for each unique-AZ subnet
+              try:
+                subnet_ids = p['SubnetIds']
+                sg = p['SecurityGroupId']
+                if isinstance(subnet_ids, str): subnet_ids = subnet_ids.split(',')
+                # Deduplicate by AZ
+                ec2 = boto3.client('ec2', region_name=region)
+                subs = ec2.describe_subnets(SubnetIds=subnet_ids)['Subnets']
+                seen_az = {}
+                for s in subs:
+                  az = s['AvailabilityZone']
+                  if az not in seen_az: seen_az[az] = s['SubnetId']
+                # Get existing mount targets
+                existing = {mt['AvailabilityZoneName']: mt['MountTargetId']
+                            for mt in efs.describe_mount_targets(FileSystemId=fsid)['MountTargets']}
+                created = []
+                for az, sid in seen_az.items():
+                  if az not in existing:
+                    for _r in range(12):
+                      try:
+                        efs.create_mount_target(FileSystemId=fsid, SubnetId=sid, SecurityGroups=[sg]);break
+                      except Exception as _e:
+                        if 'AccessDeniedException' in str(_e) and _r<11:L.info(f"IAM propagation wait {_r+1}");time.sleep(10);continue
+                        raise
+                    created.append(az)
+                    L.info(f"Created mount target in {az} ({sid})")
+                  else:
+                    L.info(f"Mount target already exists in {az}")
+                # Wait for all mount targets to become available
+                for _ in range(30):
+                  mts = efs.describe_mount_targets(FileSystemId=fsid)['MountTargets']
+                  if all(mt['LifeCycleState'] == 'available' for mt in mts): break
+                  time.sleep(5)
+                send('SUCCESS', {'Count': str(len(seen_az)), 'AZs': ','.join(sorted(seen_az.keys()))})
+              except Exception as e:
+                L.exception("EfsMountTargets failed")
+                send('FAILED', reason=str(e)[:256])
+              return
+
+            # --- QuotaCheck handler ---
+            if rt == 'Delete':
+              return send('SUCCESS')
+            if rt == 'Update':
+              try:
+                _ec2 = boto3.client('ec2', region_name=region)
+                azs = sorted([z['ZoneName'] for z in _ec2.describe_availability_zones(
+                  Filters=[{'Name': 'state', 'Values': ['available']}])['AvailabilityZones']])
+                return send('SUCCESS', {'Message': 'Update pass-through.', 'AZ1': azs[0], 'AZ2': azs[1], 'AZ3': azs[2] if len(azs) >= 3 else azs[0]})
+              except Exception as e:
+                return send('FAILED', reason=f"AZ detection on update: {e}")
+            pn, eid = p['ProjectName'], p['EnvironmentId']
+            prefix = pn + eid
+            errors = []
+            ec2 = boto3.client('ec2', region_name=region)
+            sq = boto3.client('service-quotas', region_name=region)
+            # EIP quota
+            try:
+              used = len(ec2.describe_addresses()['Addresses'])
+              limit = int(sq.get_service_quota(ServiceCode='ec2', QuotaCode='L-0263D0A3')['Quota']['Value'])
+              if limit - used < 3:
+                errors.append(f"EIP: need 3 more, only {limit-used} free ({used}/{limit}). "
+                              "Increase quota: Service Quotas > EC2 > EC2-VPC Elastic IPs (L-0263D0A3).")
+            except Exception as e:
+              errors.append(f"EIP check error: {e}")
+            # VPC quota
+            try:
+              used = len(ec2.describe_vpcs()['Vpcs'])
+              limit = int(sq.get_service_quota(ServiceCode='vpc', QuotaCode='L-F678F1CE')['Quota']['Value'])
+              if limit - used < 1:
+                errors.append(f"VPC: {used}/{int(limit)} used, no capacity. "
+                              "Increase quota: Service Quotas > VPC > VPCs per Region (L-F678F1CE).")
+            except Exception as e:
+              errors.append(f"VPC check error: {e}")
+            # NAT Gateway quota per AZ
+            try:
+              nat_limit = int(sq.get_service_quota(ServiceCode='vpc', QuotaCode='L-FE5A380F')['Quota']['Value'])
+              nats, token = [], None
+              while True:
+                kw = {'Filter': [{'Name': 'state', 'Values': ['available', 'pending']}]}
+                if token: kw['NextToken'] = token
+                resp = ec2.describe_nat_gateways(**kw)
+                nats.extend(resp['NatGateways'])
+                token = resp.get('NextToken')
+                if not token: break
+              if nats:
+                sids = list({n['SubnetId'] for n in nats})
+                sub_az = {}
+                try:
+                  sub_az = {s['SubnetId']: s['AvailabilityZone']
+                            for s in ec2.describe_subnets(SubnetIds=sids)['Subnets']}
+                except: pass
+                az_cnt = {}
+                for n in nats:
+                  az = sub_az.get(n['SubnetId'], n.get('SubnetId', '?'))
+                  az_cnt[az] = az_cnt.get(az, 0) + 1
+                for az, cnt in az_cnt.items():
+                  if cnt >= nat_limit:
+                    errors.append(f"NAT GW quota full in {az}: {cnt}/{int(nat_limit)}. "
+                                  "Increase quota: Service Quotas > VPC > NAT gateways per AZ (L-FE5A380F).")
+            except Exception as e:
+              errors.append(f"NAT GW check error: {e}")
+            # Instance type availability (m8g)
+            try:
+              avail = ec2.describe_instance_type_offerings(
+                Filters=[{'Name': 'instance-type', 'Values': ['m8g.xlarge']}])['InstanceTypeOfferings']
+              if not avail:
+                errors.append(f"m8g.xlarge not available in {region}. NodePools using m8g won't schedule pods.")
+            except Exception as e:
+              errors.append(f"Instance type check error: {e}")
+            # On-Demand vCPU quota (need at least 4 for initial node)
+            try:
+              vcpu_limit = int(sq.get_service_quota(ServiceCode='ec2', QuotaCode='L-1216C47A')['Quota']['Value'])
+              if vcpu_limit < 4:
+                errors.append(f"On-Demand vCPU quota too low: {vcpu_limit}. Need at least 4. "
+                              "Increase quota: Service Quotas > EC2 > Running On-Demand Standard instances (L-1216C47A).")
+            except Exception as e:
+              errors.append(f"vCPU quota check error: {e}")
+            # Verify deployer permissions via EC2 dry-run
+            try:
+              ec2.run_instances(DryRun=True, ImageId='ami-00000000', InstanceType='t3.micro', MinCount=1, MaxCount=1)
+            except Exception as e:
+              if 'DryRunOperation' in str(e): pass  # Has permission
+              elif 'UnauthorizedOperation' in str(e):
+                errors.append("Insufficient permissions: EC2 RunInstances denied. Deployer needs admin or PowerUser access.")
+              # Other errors (invalid AMI etc) mean permission exists
+            # EKS cluster name conflict
+            try:
+              eks = boto3.client('eks', region_name=region)
+              eks.describe_cluster(name=prefix)
+              errors.append(f"EKS cluster '{prefix}' already exists. Use a different EnvironmentId.")
+            except eks.exceptions.ResourceNotFoundException:
+              pass
+            except Exception as e:
+              errors.append(f"EKS conflict check error: {e}")
+            # IAM role name conflicts
+            iam = boto3.client('iam')
+            conflicting = []
+            for role in [f"{prefix}-EKSClusterRole", f"{prefix}-EKSNodeRole",
+                         f"{prefix}-KubectlLambdaRole", f"{prefix}-PodRole", f"{prefix}-EfsCsiRole"]:
+              try: iam.get_role(RoleName=role); conflicting.append(role)
+              except iam.exceptions.NoSuchEntityException: pass
+              except: pass
+            if conflicting:
+              errors.append(f"IAM roles already exist: {', '.join(conflicting)}. Use a different EnvironmentId.")
+            # Lambda function name conflicts
+            lm = boto3.client('lambda', region_name=region)
+            conflicting = []
+            for fn in [f"{prefix}-kubectl", f"{prefix}-cognito-setup", f"{prefix}-cognito-user-creator",
+                       f"{prefix}-cognito-pre-token-gen", f"{prefix}-cognito-lambda-config",
+                       f"{prefix}-eg-installer", f"{prefix}-nlb-lookup", f"{prefix}-alb-lookup",
+                       f"{prefix}-cf-sg-ingress", f"{prefix}-helm-deploy"]:
+              try: lm.get_function(FunctionName=fn); conflicting.append(fn)
+              except lm.exceptions.ResourceNotFoundException: pass
+              except: pass
+            if conflicting:
+              errors.append(f"Lambda functions already exist: {', '.join(conflicting)}. Use a different EnvironmentId.")
+            # Cognito domain conflict
+            try:
+              acct = boto3.client('sts').get_caller_identity()['Account']
+              domain = f"cnf-{eid}-{acct}"
+              resp = boto3.client('cognito-idp', region_name=region).describe_user_pool_domain(Domain=domain)
+              if resp.get('DomainDescription', {}).get('Domain'):
+                errors.append(f"Cognito domain '{domain}' already exists. Use a different EnvironmentId.")
+            except Exception:
+              pass
+            # Validate Tags parameter
+            try:
+              import re
+              tags_raw = p.get('Tags', '{}')
+              tags = json.loads(tags_raw) if isinstance(tags_raw, str) else tags_raw
+              if not isinstance(tags, dict):
+                errors.append("Tags must be a JSON object (e.g. {\"Key\":\"Value\"}).")
+              else:
+                tag_re = re.compile(r'^[\w\s_.:/=+\-@]{1,128}$')
+                val_re = re.compile(r'^[\w\s_.:/=+\-@]{0,256}$')
+                for k, v in tags.items():
+                  if k.startswith('aws:'):
+                    errors.append(f"Tag key '{k}' cannot start with 'aws:' (reserved prefix).")
+                  if not tag_re.match(k):
+                    errors.append(f"Tag key '{k}' invalid (1-128 chars, alphanumeric/spaces/_.:/=+-@).")
+                  if not val_re.match(str(v)):
+                    errors.append(f"Tag value for '{k}' invalid (0-256 chars, alphanumeric/spaces/_.:/=+-@).")
+                if len(tags) > 45:
+                  errors.append(f"Too many tags ({len(tags)}). Max 45 user tags (AWS reserves 5).")
+            except json.JSONDecodeError as e:
+              errors.append(f"Tags is not valid JSON: {e}")
+            # Detect AZs
+            try:
+              azs = sorted([z['ZoneName'] for z in ec2.describe_availability_zones(
+                Filters=[{'Name': 'state', 'Values': ['available']}])['AvailabilityZones']])
+              az1, az2 = azs[0], azs[1]
+              az3 = azs[2] if len(azs) >= 3 else azs[0]
+            except Exception as e:
+              errors.append(f"AZ detection error: {e}")
+              az1 = az2 = az3 = ""
+            # Result
+            if errors:
+              return send('FAILED', {},
+                f"PRE-FLIGHT CHECK FAILED ({len(errors)} issue(s)): " + " | ".join(errors))
+            send('SUCCESS', {'Message': 'All checks passed.', 'AZ1': az1, 'AZ2': az2, 'AZ3': az3})
+
+  QuotaCheck:
+    Type: Custom::QuotaCheck
+    Properties:
+      ServiceToken: !GetAtt QuotaCheckFunction.Arn
+      ProjectName: !Ref ProjectName
+      EnvironmentId: !Ref EnvironmentId
+      Region: !Ref "AWS::Region"
+      Tags: !Ref Tags
+
+  # ============================================================================
+  # SECTION 1: VPC + NETWORKING (IPv6 Dual-Stack)
+  # ============================================================================
+
+  VPC:
+    Type: AWS::EC2::VPC
+    DependsOn: QuotaCheck
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-vpc"
+
+  IPv6CidrBlock:
+    Type: AWS::EC2::VPCCidrBlock
+    Properties:
+      VpcId: !Ref VPC
+      AmazonProvidedIpv6CidrBlock: true
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    DependsOn: QuotaCheck
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-igw"
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  EgressOnlyIGW:
+    Type: AWS::EC2::EgressOnlyInternetGateway
+    Properties:
+      VpcId: !Ref VPC
+
+  # --- Elastic IPs for NAT Gateways ---
+  EipNatA:
+    Type: AWS::EC2::EIP
+    DependsOn: QuotaCheck
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-nat-eip-a"
+
+  EipNatB:
+    Type: AWS::EC2::EIP
+    DependsOn: QuotaCheck
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-nat-eip-b"
+
+  EipNatC:
+    Type: AWS::EC2::EIP
+    DependsOn: QuotaCheck
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-nat-eip-c"
+
+  # --- Public Subnets ---
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    DependsOn: IPv6CidrBlock
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !GetAtt QuotaCheck.AZ1
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 16, "12"]]
+      Ipv6CidrBlock: !Select [0, !Cidr [!Select [0, !GetAtt VPC.Ipv6CidrBlocks], 8, "64"]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-public-a"
+        - Key: kubernetes.io/role/elb
+          Value: "1"
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    DependsOn: IPv6CidrBlock
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !GetAtt QuotaCheck.AZ2
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 16, "12"]]
+      Ipv6CidrBlock: !Select [1, !Cidr [!Select [0, !GetAtt VPC.Ipv6CidrBlocks], 8, "64"]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-public-b"
+        - Key: kubernetes.io/role/elb
+          Value: "1"
+
+  PublicSubnetC:
+    Type: AWS::EC2::Subnet
+    DependsOn: IPv6CidrBlock
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !GetAtt QuotaCheck.AZ3
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 16, "12"]]
+      Ipv6CidrBlock: !Select [2, !Cidr [!Select [0, !GetAtt VPC.Ipv6CidrBlocks], 8, "64"]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-public-c"
+        - Key: kubernetes.io/role/elb
+          Value: "1"
+
+  # --- Private Subnets (IPv6 auto-assign) ---
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    DependsOn: IPv6CidrBlock
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !GetAtt QuotaCheck.AZ1
+      CidrBlock: !Select [8, !Cidr [!Ref VpcCidr, 16, "12"]]
+      Ipv6CidrBlock: !Select [3, !Cidr [!Select [0, !GetAtt VPC.Ipv6CidrBlocks], 8, "64"]]
+      AssignIpv6AddressOnCreation: true
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-private-a"
+        - Key: kubernetes.io/role/internal-elb
+          Value: "1"
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    DependsOn: IPv6CidrBlock
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !GetAtt QuotaCheck.AZ2
+      CidrBlock: !Select [9, !Cidr [!Ref VpcCidr, 16, "12"]]
+      Ipv6CidrBlock: !Select [4, !Cidr [!Select [0, !GetAtt VPC.Ipv6CidrBlocks], 8, "64"]]
+      AssignIpv6AddressOnCreation: true
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-private-b"
+        - Key: kubernetes.io/role/internal-elb
+          Value: "1"
+
+  PrivateSubnetC:
+    Type: AWS::EC2::Subnet
+    DependsOn: IPv6CidrBlock
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !GetAtt QuotaCheck.AZ3
+      CidrBlock: !Select [10, !Cidr [!Ref VpcCidr, 16, "12"]]
+      Ipv6CidrBlock: !Select [5, !Cidr [!Select [0, !GetAtt VPC.Ipv6CidrBlocks], 8, "64"]]
+      AssignIpv6AddressOnCreation: true
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-private-c"
+        - Key: kubernetes.io/role/internal-elb
+          Value: "1"
+
+  # --- NAT Gateways (one per AZ) ---
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    DependsOn: IGWAttachment
+    Properties:
+      AllocationId: !GetAtt EipNatA.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-nat-a"
+
+  NatGatewayB:
+    Type: AWS::EC2::NatGateway
+    DependsOn: IGWAttachment
+    Properties:
+      AllocationId: !GetAtt EipNatB.AllocationId
+      SubnetId: !Ref PublicSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-nat-b"
+
+  NatGatewayC:
+    Type: AWS::EC2::NatGateway
+    DependsOn: IGWAttachment
+    Properties:
+      AllocationId: !GetAtt EipNatC.AllocationId
+      SubnetId: !Ref PublicSubnetC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-nat-c"
+
+  # --- Route Tables ---
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-rtb-public"
+
+  PublicRouteIpv4:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  PublicRouteIpv6:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationIpv6CidrBlock: "::/0"
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetCRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetC
+      RouteTableId: !Ref PublicRouteTable
+
+  # Private Route Tables (one per AZ for independent NAT)
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-rtb-private-a"
+
+  PrivateRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref NatGatewayA
+
+  PrivateRouteA6:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationIpv6CidrBlock: "::/0"
+      EgressOnlyInternetGatewayId: !Ref EgressOnlyIGW
+
+  PrivateSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTableA
+
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-rtb-private-b"
+
+  PrivateRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref NatGatewayB
+
+  PrivateRouteB6:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationIpv6CidrBlock: "::/0"
+      EgressOnlyInternetGatewayId: !Ref EgressOnlyIGW
+
+  PrivateSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTableB
+
+  PrivateRouteTableC:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-rtb-private-c"
+
+  PrivateRouteC:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableC
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref NatGatewayC
+
+  PrivateRouteC6:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableC
+      DestinationIpv6CidrBlock: "::/0"
+      EgressOnlyInternetGatewayId: !Ref EgressOnlyIGW
+
+  PrivateSubnetCRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetC
+      RouteTableId: !Ref PrivateRouteTableC
+
+  # --- S3 Gateway Endpoint ---
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTableA
+        - !Ref PrivateRouteTableB
+        - !Ref PrivateRouteTableC
+
+  # ============================================================================
+  # SECTION 2: IAM ROLES
+  # ============================================================================
+
+  # --- EKS Cluster Role ---
+  EksClusterRole:
+    Type: AWS::IAM::Role
+    DependsOn: QuotaCheck
+    Properties:
+      RoleName: !Sub "${ProjectName}${EnvironmentId}-EKSClusterRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+              - "sts:TagSession"   # Required for eks.7+ to use cluster role for Karpenter compute ops
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+        - arn:aws:iam::aws:policy/AmazonEKSComputePolicy
+        - arn:aws:iam::aws:policy/AmazonEKSBlockStoragePolicy
+        - arn:aws:iam::aws:policy/AmazonEKSLoadBalancingPolicy
+        - arn:aws:iam::aws:policy/AmazonEKSNetworkingPolicy
+      Policies:
+        - PolicyName: AllowCustomNodeClassTags
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateLaunchTemplate
+                  - ec2:CreateFleet
+                  - ec2:RunInstances
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    "aws:RequestTag/eks:eks-cluster-name": "${aws:PrincipalTag/eks:eks-cluster-name}"
+                  StringLike:
+                    "aws:RequestTag/eks:kubernetes-node-class-name": "*"
+                    "aws:RequestTag/eks:kubernetes-node-pool-name": "*"
+
+  # --- EKS Node Role ---
+  EksNodeRole:
+    Type: AWS::IAM::Role
+    DependsOn: QuotaCheck
+    Properties:
+      RoleName: !Sub "${ProjectName}${EnvironmentId}-EKSNodeRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodeMinimalPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly
+
+  # --- Lambda Execution Role (for K8s resource management) ---
+  KubectlLambdaRole:
+    Type: AWS::IAM::Role
+    DependsOn: QuotaCheck
+    Properties:
+      RoleName: !Sub "${ProjectName}${EnvironmentId}-KubectlLambdaRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: EksAndSts
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                  - eks:ListClusters
+                  - eks:ListAddons
+                  - eks:DescribeAddon
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:DescribeListeners
+                  - elasticloadbalancing:DescribeTargetHealth
+                  - elasticloadbalancing:DescribeTargetGroups
+                Resource: "*"
+              # Required by CloudFrontSgIngressFunction to authorize the
+              # CloudFront VPC Origin managed SG into the internal ALB SG.
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeSecurityGroups
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupIngress
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - cognito-idp:DescribeUserPool
+                  - cognito-idp:DescribeUserPoolClient
+                  - cognito-idp:UpdateUserPoolClient
+                  - cognito-idp:UpdateUserPool
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminSetUserPassword
+                  - cognito-idp:AdminAddUserToGroup
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}${EnvironmentId}-*"
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStackEvents
+                Resource: "*"
+
+  # --- Test Pod IRSA Role (via Pod Identity) ---
+  PodRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}${EnvironmentId}-PodRole"
+      AssumeRolePolicyDocument:
+        Fn::Sub:
+          - |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {"Effect":"Allow","Principal":{"Service":"pods.eks.amazonaws.com"},"Action":["sts:AssumeRole","sts:TagSession"]},
+                {"Effect":"Allow","Principal":{"Federated":"${OidcArn}"},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{"StringEquals":{"${OidcHost}:aud":"sts.amazonaws.com"}}}
+              ]
+            }
+          - OidcArn: !GetAtt EksOidcProvider.Arn
+            OidcHost: !Select [1, !Split ["https://", !GetAtt EksCluster.OpenIdConnectIssuerUrl]]
+      Policies:
+        - PolicyName: CNFPodReadOnly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: STSCallerIdentity
+                Effect: Allow
+                Action: sts:GetCallerIdentity
+                Resource: "*"
+              - Sid: BedrockFullAccess
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                  - bedrock:ListInferenceProfiles
+                  - bedrock:GetInferenceProfile
+                Resource: "*"
+              # bedrock-mantle is a separate IAM service prefix from bedrock.
+              # GPT-5.4/5.5 are only served via the OpenAI-compatible
+              # bedrock-mantle endpoint, whose inference call is authorized by
+              # bedrock-mantle:CreateInference (not bedrock:InvokeModel).
+              - Sid: BedrockMantleInference
+                Effect: Allow
+                Action:
+                  - bedrock-mantle:CreateInference
+                  - bedrock-mantle:GetInference
+                  - bedrock-mantle:CancelInference
+                  - bedrock-mantle:DeleteInference
+                  - bedrock-mantle:ListModels
+                  - bedrock-mantle:GetModel
+                Resource: "*"
+              - Sid: IAMRoleRead
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListRolePolicies
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${ProjectName}${EnvironmentId}-PodRole"
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:BatchGetItem
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}${EnvironmentId}-sessions*"
+
+  EfsCsiRole:
+    Type: AWS::IAM::Role
+    DependsOn: QuotaCheck
+    Properties:
+      RoleName: !Sub "${ProjectName}${EnvironmentId}-EfsCsiRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+              - "sts:TagSession"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEFSCSIDriverPolicy
+
+  # ============================================================================
+  # SECTION 3: EKS CLUSTER
+  # ============================================================================
+
+  EksCluster:
+    Type: AWS::EKS::Cluster
+    DependsOn:
+      - PrivateSubnetARouteAssoc
+      - PrivateSubnetBRouteAssoc
+      - PrivateSubnetCRouteAssoc
+      - PublicSubnetARouteAssoc
+      - PublicSubnetBRouteAssoc
+      - PublicSubnetCRouteAssoc
+      - NatGatewayA
+      - NatGatewayB
+      - NatGatewayC
+      - S3Endpoint
+    Properties:
+      Name: !Sub "${ProjectName}${EnvironmentId}"
+      Version: !Ref EksVersion
+      RoleArn: !GetAtt EksClusterRole.Arn
+      AccessConfig:
+        AuthenticationMode: API
+      BootstrapSelfManagedAddons: false
+      ComputeConfig:
+        Enabled: true
+        NodePools:
+          - system
+        NodeRoleArn: !GetAtt EksNodeRole.Arn
+      StorageConfig:
+        BlockStorage:
+          Enabled: true
+      KubernetesNetworkConfig:
+        IpFamily: ipv6
+        ElasticLoadBalancing:
+          Enabled: true
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+          - !Ref PrivateSubnetC
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+        PublicAccessCidrs:
+          - "0.0.0.0/0"
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}"
+
+  # --- EKS Access Entry for Lambda (cluster admin) ---
+  LambdaAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref EksCluster
+      PrincipalArn: !GetAtt KubectlLambdaRole.Arn
+      Type: STANDARD
+      AccessPolicies:
+        - AccessScope:
+            Type: cluster
+          PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+
+  # NodeAccessEntry is auto-created by EKS when NodeRoleArn is set in ComputeConfig.
+  # We do NOT create it explicitly — doing so would conflict with the auto-created entry.
+
+  AdminAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Condition: HasAdminRole
+    Properties:
+      ClusterName: !Ref EksCluster
+      PrincipalArn: !Ref AdminRoleArn
+      Type: STANDARD
+      AccessPolicies:
+        - AccessScope:
+            Type: cluster
+          PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+
+  # --- Allow Lambda SG to reach EKS cluster private API endpoint (TCP 443) ---
+  ClusterSGIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt EksCluster.ClusterSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref KubectlLambdaSG
+      Description: "Allow Lambda to reach EKS API private endpoint"
+
+  # ============================================================================
+  # SECTION 3.5: EFS FILE SYSTEM
+  # ============================================================================
+
+  EfsFileSystem:
+    Type: AWS::EFS::FileSystem
+    DependsOn: QuotaCheck
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-efs"
+
+  EfsMountTargets:
+    Type: Custom::EfsMountTargets
+    Properties:
+      ServiceToken: !GetAtt QuotaCheckFunction.Arn
+      FileSystemId: !Ref EfsFileSystem
+      Region: !Ref "AWS::Region"
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+        - !Ref PrivateSubnetC
+      SecurityGroupId: !GetAtt EksCluster.ClusterSecurityGroupId
+
+  # ============================================================================
+  # SECTION 3.6: DATA SERVICES (DocumentDB, ElastiCache, DynamoDB, Bedrock Memory)
+  # ============================================================================
+
+  # --- Security Group for Data Services (DocumentDB + ElastiCache) ---
+  DataServicesSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName}${EnvironmentId} data services SG"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 27017
+          ToPort: 27017
+          SourceSecurityGroupId: !GetAtt EksCluster.ClusterSecurityGroupId
+          Description: "DocumentDB from EKS"
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !GetAtt EksCluster.ClusterSecurityGroupId
+          Description: "Valkey from EKS"
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !GetAtt EksCluster.ClusterSecurityGroupId
+          Description: "PostgreSQL from EKS"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-data-services-sg"
+
+  # --- DocumentDB Elastic Cluster (MongoDB-compatible, Serverless) ---
+
+  ValkeyUser:
+    Type: AWS::ElastiCache::User
+    Properties:
+      UserId: !Sub "cnf-${EnvironmentId}-valkey-user"
+      UserName: default
+      Engine: valkey
+      AccessString: "on ~* +@all"
+      AuthenticationMode:
+        Type: password
+        Passwords:
+          - !Sub "${ProjectName}${EnvironmentId}Valkey2026!"
+
+  ValkeyUserGroup:
+    Type: AWS::ElastiCache::UserGroup
+    Properties:
+      UserGroupId: !Sub "cnf-${EnvironmentId}-valkey-ug"
+      Engine: valkey
+      UserIds:
+        - !Ref ValkeyUser
+
+  # --- ElastiCache Serverless (Valkey) ---
+  ValkeyCache:
+    Type: AWS::ElastiCache::ServerlessCache
+    DependsOn: ValkeyUserGroup
+    Properties:
+      ServerlessCacheName: !Sub "${ProjectName}${EnvironmentId}-valkey"
+      Engine: valkey
+      MajorEngineVersion: "8"
+      SecurityGroupIds:
+        - !Ref DataServicesSG
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+        - !Ref PrivateSubnetC
+      UserGroupId: !Ref ValkeyUserGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-valkey"
+
+  # --- DynamoDB Table (A2A session message storage, on-demand) ---
+  SessionTable:
+    Type: AWS::DynamoDB::Table
+    DependsOn: QuotaCheck
+    Properties:
+      TableName: !Sub "${ProjectName}${EnvironmentId}-sessions"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-sessions"
+
+  # --- Bedrock AgentCore Memory (long-term conversation memory) ---
+
+
+  AuroraSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "${ProjectName}${EnvironmentId} Aurora subnets"
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+        - !Ref PrivateSubnetC
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      DBClusterIdentifier: !Sub "${ProjectName}${EnvironmentId}-pg"
+      Engine: aurora-postgresql
+      EngineVersion: "17.7"
+      DatabaseName: litellm
+      MasterUsername: pgadmin
+      MasterUserPassword: !Sub "${ProjectName}${EnvironmentId}Pg2026!"
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 2
+      DBSubnetGroupName: !Ref AuroraSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DataServicesSG
+      StorageEncrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-pg"
+
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+
+  # ============================================================================
+  # SECTION 4: EKS ADDONS
+  # ============================================================================
+
+  # Custom Resource: Apply NodePools before addons so custom pools schedule system pods
+  K8sNodePools:
+    Type: Custom::K8sNodePools
+    DependsOn:
+      - LambdaAccessEntry
+      - ClusterSGIngressFromLambda
+    Properties:
+      ServiceToken: !GetAtt KubectlFunction.Arn
+      ClusterName: !Ref EksCluster
+      Region: !Ref "AWS::Region"
+      PostApplySleep: "60"
+      NodeClassTags: !Ref Tags
+      Manifests:
+        # --- Custom NodePool: cpu-system (replaces built-in system for m8g.xlarge) ---
+        - apiVersion: karpenter.sh/v1
+          kind: NodePool
+          metadata:
+            name: cpu-system
+            labels:
+              app.kubernetes.io/managed-by: eks
+            annotations:
+              karpenter.sh/nodepool-hash-version: v3
+          spec:
+            disruption:
+              budgets:
+                - nodes: 10%
+              consolidateAfter: 15m
+              consolidationPolicy: WhenEmpty
+            template:
+              metadata:
+                labels:
+                  usage: system
+              spec:
+                expireAfter: 480h
+                nodeClassRef:
+                  group: eks.amazonaws.com
+                  kind: NodeClass
+                  name: default-tags
+                requirements:
+                  - key: karpenter.sh/capacity-type
+                    operator: In
+                    values:
+                      - on-demand
+                  - key: node.kubernetes.io/instance-type
+                    operator: In
+                    values:
+                      - m8g.xlarge
+                  - key: kubernetes.io/os
+                    operator: In
+                    values:
+                      - linux
+                taints:
+                  - effect: NoSchedule
+                    key: CriticalAddonsOnly
+                terminationGracePeriod: 24h0m0s
+        # --- Custom NodePool: cpu (arm64 m8g general workloads) ---
+        - apiVersion: karpenter.sh/v1
+          kind: NodePool
+          metadata:
+            name: cpu
+            labels:
+              app.kubernetes.io/managed-by: eks
+            annotations:
+              karpenter.sh/nodepool-hash-version: v3
+          spec:
+            disruption:
+              budgets:
+                - nodes: 10%
+              consolidateAfter: 15m
+              consolidationPolicy: WhenEmpty
+            limits:
+              cpu: "1000"
+              memory: 1000Gi
+            template:
+              metadata:
+                labels:
+                  type: cpu
+              spec:
+                expireAfter: 480h
+                nodeClassRef:
+                  group: eks.amazonaws.com
+                  kind: NodeClass
+                  name: default-tags
+                requirements:
+                  - key: eks.amazonaws.com/instance-family
+                    operator: In
+                    values:
+                      - m8g
+                  - key: eks.amazonaws.com/instance-cpu
+                    operator: In
+                    values:
+                      - "2"
+                      - "4"
+                      - "8"
+                      - "16"
+                      - "32"
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values:
+                      - arm64
+                  - key: karpenter.sh/capacity-type
+                    operator: In
+                    values:
+                      - on-demand
+        # --- Custom NodePool: cpu-large (arm64 m8g large with taint) ---
+        - apiVersion: karpenter.sh/v1
+          kind: NodePool
+          metadata:
+            name: cpu-large
+            labels:
+              app.kubernetes.io/managed-by: eks
+            annotations:
+              karpenter.sh/nodepool-hash-version: v3
+          spec:
+            disruption:
+              budgets:
+                - nodes: 10%
+              consolidateAfter: 15m
+              consolidationPolicy: WhenEmpty
+            limits:
+              cpu: "1000"
+              memory: 1000Gi
+            template:
+              metadata:
+                labels:
+                  type: cpu-large
+              spec:
+                expireAfter: 480h
+                nodeClassRef:
+                  group: eks.amazonaws.com
+                  kind: NodeClass
+                  name: default-tags
+                requirements:
+                  - key: eks.amazonaws.com/instance-family
+                    operator: In
+                    values:
+                      - m8g
+                  - key: eks.amazonaws.com/instance-cpu
+                    operator: In
+                    values:
+                      - "8"
+                      - "16"
+                      - "32"
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values:
+                      - arm64
+                  - key: karpenter.sh/capacity-type
+                    operator: In
+                    values:
+                      - on-demand
+                taints:
+                  - effect: NoSchedule
+                    key: size
+                    value: "large"
+        # --- Custom NodePool: gpu (nvidia g6e.2xlarge) ---
+        - apiVersion: karpenter.sh/v1
+          kind: NodePool
+          metadata:
+            name: gpu
+            labels:
+              app.kubernetes.io/managed-by: eks
+            annotations:
+              karpenter.sh/nodepool-hash-version: v3
+          spec:
+            disruption:
+              budgets:
+                - nodes: 10%
+              consolidateAfter: 15m
+              consolidationPolicy: WhenEmpty
+            limits:
+              cpu: "1000"
+              memory: 1000Gi
+              nvidia.com/gpu: 32
+            template:
+              metadata:
+                labels:
+                  type: gpu
+              spec:
+                expireAfter: 470h
+                nodeClassRef:
+                  group: eks.amazonaws.com
+                  kind: NodeClass
+                  name: default-tags
+                requirements:
+                  - key: node.kubernetes.io/instance-type
+                    operator: In
+                    values:
+                      - g6e.2xlarge
+                  - key: eks.amazonaws.com/instance-gpu-manufacturer
+                    operator: In
+                    values:
+                      - nvidia
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values:
+                      - amd64
+                  - key: karpenter.sh/capacity-type
+                    operator: In
+                    values:
+                      - on-demand
+                taints:
+                  - effect: NoSchedule
+                    key: nvidia.com/gpu
+                    value: "true"
+        # --- Custom NodePool: cpu-general (x86 c8a/c8i with taint) ---
+        - apiVersion: karpenter.sh/v1
+          kind: NodePool
+          metadata:
+            name: cpu-general
+            labels:
+              app.kubernetes.io/managed-by: eks
+            annotations:
+              karpenter.sh/nodepool-hash-version: v3
+          spec:
+            disruption:
+              budgets:
+                - nodes: 10%
+              consolidateAfter: 15m
+              consolidationPolicy: WhenEmpty
+            limits:
+              cpu: "128"
+              memory: 256Gi
+            template:
+              metadata:
+                labels:
+                  type: cpu-x86
+              spec:
+                expireAfter: 472h
+                nodeClassRef:
+                  group: eks.amazonaws.com
+                  kind: NodeClass
+                  name: default-tags
+                requirements:
+                  - key: karpenter.sh/capacity-type
+                    operator: In
+                    values:
+                      - on-demand
+                  - key: eks.amazonaws.com/instance-family
+                    operator: In
+                    values:
+                      - c8a
+                      - c8i
+                      - c8i-flex
+                      - c7a
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values:
+                      - amd64
+                taints:
+                  - effect: NoSchedule
+                    key: arch
+                    value: x86_64
+                terminationGracePeriod: 24h0m0s
+
+  AddonVpcCni:
+    Type: AWS::EKS::Addon
+    DependsOn:
+      - LambdaAccessEntry
+      - K8sNodePools
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: vpc-cni
+      ResolveConflicts: OVERWRITE
+      ConfigurationValues: !Sub |
+        {
+          "env": {
+            "ENABLE_V6_EGRESS": "true",
+            "ENABLE_PREFIX_DELEGATION": "true",
+            "WARM_PREFIX_TARGET": "1",
+            "WARM_IP_TARGET": "0",
+            "MINIMUM_IP_TARGET": "0"
+          },
+          "init": {
+            "env": {
+              "ENABLE_V6_EGRESS": "true",
+              "DISABLE_TCP_EARLY_DEMUX": "true"
+            }
+          }
+        }
+
+  AddonCoreDns:
+    Type: AWS::EKS::Addon
+    DependsOn: AddonVpcCni
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: coredns
+      ResolveConflicts: OVERWRITE
+
+  AddonKubeProxy:
+    Type: AWS::EKS::Addon
+    DependsOn: AddonVpcCni
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: kube-proxy
+      ResolveConflicts: OVERWRITE
+
+  AddonPodIdentity:
+    Type: AWS::EKS::Addon
+    DependsOn: AddonVpcCni
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: eks-pod-identity-agent
+      ResolveConflicts: OVERWRITE
+
+  AddonMetricsServer:
+    Type: AWS::EKS::Addon
+    DependsOn: AddonCoreDns
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: metrics-server
+      ResolveConflicts: OVERWRITE
+
+  AddonEfsCsi:
+    Type: AWS::EKS::Addon
+    DependsOn: AddonVpcCni
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: aws-efs-csi-driver
+      ResolveConflicts: OVERWRITE
+
+  AddonS3Csi:
+    Type: AWS::EKS::Addon
+    DependsOn: AddonVpcCni
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: aws-mountpoint-s3-csi-driver
+      ResolveConflicts: OVERWRITE
+
+  AddonCertManager:
+    Type: AWS::EKS::Addon
+    DependsOn: AddonVpcCni
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: cert-manager
+      ResolveConflicts: OVERWRITE
+      ConfigurationValues: |
+        {
+          "extraArgs": ["--enable-gateway-api=true"]
+        }
+
+  # --- IAM OIDC Provider for IRSA ---
+  EksOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: !GetAtt EksCluster.OpenIdConnectIssuerUrl
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - "06b25927c42a721631c1efd9431e648fa62e1e39"
+
+  # ============================================================================
+  # SECTION 5: KUBECTL LAMBDA FUNCTION (inline boto3/urllib3)
+  # ============================================================================
+
+  KubectlLambdaSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName}${EnvironmentId} kubectl lambda SG"
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: "-1"
+          CidrIpv6: "::/0"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-kubectl-lambda-sg"
+
+  KubectlFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - LambdaAccessEntry
+      - ClusterSGIngressFromLambda
+    Properties:
+      FunctionName: !Sub "${ProjectName}${EnvironmentId}-kubectl"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 900
+      MemorySize: 512
+      Role: !GetAtt KubectlLambdaRole.Arn
+      Environment:
+        Variables:
+          CLUSTER_NAME: !Ref EksCluster
+          REGION: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          import base64,json,logging,tempfile,time,urllib3,boto3
+          from botocore.signers import RequestSigner
+          L=logging.getLogger();L.setLevel(logging.INFO)
+          _CTX=None
+          def has_time(margin=60):
+            return _CTX is None or _CTX.get_remaining_time_in_millis()>margin*1000
+          CORE={"Namespace":("api/v1","namespaces",0),"Service":("api/v1","services",1),"ConfigMap":("api/v1","configmaps",1),"Secret":("api/v1","secrets",1),"ServiceAccount":("api/v1","serviceaccounts",1),"Pod":("api/v1","pods",1)}
+          GRP={"Deployment":("apis/apps/v1","deployments",1),"DaemonSet":("apis/apps/v1","daemonsets",1),"ClusterRole":("apis/rbac.authorization.k8s.io/v1","clusterroles",0),"ClusterRoleBinding":("apis/rbac.authorization.k8s.io/v1","clusterrolebindings",0),"Role":("apis/rbac.authorization.k8s.io/v1","roles",1),"RoleBinding":("apis/rbac.authorization.k8s.io/v1","rolebindings",1),"CustomResourceDefinition":("apis/apiextensions.k8s.io/v1","customresourcedefinitions",0),"StorageClass":("apis/storage.k8s.io/v1","storageclasses",0),"PersistentVolume":("api/v1","persistentvolumes",0),"PersistentVolumeClaim":("api/v1","persistentvolumeclaims",1),"ClusterIssuer":("apis/cert-manager.io/v1","clusterissuers",0),"Certificate":("apis/cert-manager.io/v1","certificates",1)}
+          PLURALS={"GatewayClass":"gatewayclasses","Gateway":"gateways","HTTPRoute":"httproutes","TCPRoute":"tcproutes","TLSRoute":"tlsroutes","GRPCRoute":"grpcroutes","EnvoyProxy":"envoyproxies","SecurityPolicy":"securitypolicies","BackendTrafficPolicy":"backendtrafficpolicies","ClientTrafficPolicy":"clienttrafficpolicies","EnvoyExtensionPolicy":"envoyextensionpolicies","BackendLBPolicy":"backendlbpolicies","ReferenceGrant":"referencegrants","NodePool":"nodepools","NodeClass":"nodeclasses","Ingress":"ingresses","IngressClass":"ingressclasses"}
+          INT_FIELDS={"port","number","nodePort","replicas","containerPort","hostPort","targetPort","terminationGracePeriodSeconds","timeoutSeconds","initialDelaySeconds","periodSeconds","successThreshold","failureThreshold","weight","minReadySeconds","minReplicas","maxReplicas","revisionHistoryLimit","progressDeadlineSeconds","iops","throughput","runAsUser","runAsGroup","fsGroup","runAsNonRoot","value","maxConcurrentStreams","maxAcceptPerSocketEvent","initialStreamWindowSize","initialConnectionWindowSize","averageUtilization","stabilizationWindowSeconds","maxUnavailable","maxSurge","maxPendingRequests","maxConnections","maxParallelRequests","maxRetries"}
+          BOOL_FIELDS={"preserveHeaderCase","enabled","readOnly","optional","hostNetwork","shareProcessNamespace"}
+          def coerce_ints(obj,key=None):
+            if isinstance(obj,dict):return{k:coerce_ints(v,k) for k,v in obj.items()}
+            if isinstance(obj,list):return[coerce_ints(i,key) for i in obj]
+            if isinstance(obj,str) and key in INT_FIELDS and obj.lstrip('-').isdigit():
+              try:return int(obj)
+              except:pass
+            if isinstance(obj,str) and key in BOOL_FIELDS and obj.lower() in("true","false"):
+              return obj.lower()=="true"
+            return obj
+          def get_token(session,cluster,region):
+            sts=session.client("sts",region_name=region)
+            si=sts.meta.service_model.service_id
+            sg=RequestSigner(si,region,"sts","v4",session.get_credentials(),session.events)
+            p={"method":"GET","url":f"https://sts.{region}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15","body":{},"headers":{"x-k8s-aws-id":cluster},"context":{}}
+            u=sg.generate_presigned_url(p,region_name=region,expires_in=60,operation_name="")
+            return "k8s-aws-v1."+base64.urlsafe_b64encode(u.encode()).decode().rstrip("=")
+          def rpath(av,kind,ns):
+            for t in[CORE,GRP]:
+              if kind in t:
+                px,pl,nsd=t[kind]
+                return f"/{px}/namespaces/{ns}/{pl}" if nsd and ns else f"/{px}/{pl}"
+            pl=PLURALS.get(kind,kind.lower()+"s")
+            px=f"apis/{av}" if "/" in av else f"api/{av}"
+            return f"/{px}/namespaces/{ns}/{pl}" if ns else f"/{px}/{pl}"
+          def k8s_apply(http,ep,token,m,retries=40):
+            av=m.get("apiVersion","");kind=m.get("kind","");md=m.get("metadata",{})
+            name=md.get("name","");ns=md.get("namespace")
+            p=rpath(av,kind,ns)
+            hd={"Authorization":f"Bearer {token}","Content-Type":"application/json","Accept":"application/json"}
+            b=json.dumps(m).encode()
+            last_status=0;last_body={};last_attempt=0
+            for attempt in range(retries):
+              if not has_time(120):break
+              r=http.request("POST",f"{ep}{p}",headers=hd,body=b)
+              if r.status==409:
+                hd["Content-Type"]="application/merge-patch+json"
+                r=http.request("PATCH",f"{ep}{p}/{name}",headers=hd,body=b)
+                return "updated",r.status,json.loads(r.data.decode()) if r.data else {}
+              if 200<=r.status<300:
+                if attempt>0:L.info(f"{kind}/{name} succeeded after {attempt+1} attempts")
+                return "created",r.status,json.loads(r.data.decode()) if r.data else {}
+              last_status=r.status;last_attempt=attempt+1
+              try:last_body=json.loads(r.data.decode()) if r.data else {}
+              except:last_body={"raw":r.data.decode()[:500] if r.data else ""}
+              if attempt==0:L.warning(f"{r.status} body: {str(last_body)[:500]}")
+              wait=min(30,5*(attempt+1))
+              L.warning(f"{r.status} on {kind}/{name}, retry {attempt+1}/{retries} in {wait}s")
+              time.sleep(wait)
+            msg=last_body.get("message",str(last_body)[:200]) if isinstance(last_body,dict) else str(last_body)[:200]
+            return "error",last_status,{"retries":last_attempt,"message":msg}
+          def k8s_delete(http,ep,token,m):
+            av=m.get("apiVersion","");kind=m.get("kind","");md=m.get("metadata",{})
+            name=md.get("name","");ns=md.get("namespace")
+            p=rpath(av,kind,ns)
+            hd={"Authorization":f"Bearer {token}","Accept":"application/json"}
+            r=http.request("DELETE",f"{ep}{p}/{name}",headers=hd)
+            return("deleted" if 200<=r.status<300 or r.status==404 else "error"),r.status
+          def k8s_get(http,ep,token,av,kind,name,ns=None):
+            p=rpath(av,kind,ns)
+            hd={"Authorization":f"Bearer {token}","Accept":"application/json"}
+            r=http.request("GET",f"{ep}{p}/{name}",headers=hd)
+            return r.status,json.loads(r.data.decode()) if r.data else {}
+          def send_cfn(event,ctx,status,data=None,reason=None,pid=None):
+            body=json.dumps({"Status":status,"Reason":reason or f"See logs: {ctx.log_stream_name}","PhysicalResourceId":pid or event.get("PhysicalResourceId",ctx.log_stream_name),"StackId":event["StackId"],"RequestId":event["RequestId"],"LogicalResourceId":event["LogicalResourceId"],"Data":data or {}})
+            urllib3.PoolManager().request("PUT",event["ResponseURL"],body=body.encode(),headers={"Content-Type":""})
+          MAX_REINVOKES=4  # 4 reinvokes × 15min = 75min total
+          def reinvoke_or_fail(event,ctx,reason):
+            attempt=event.get("_Attempt",0)
+            if attempt<MAX_REINVOKES:
+              L.info(f"Timeout approaching, reinvoking (attempt {attempt+1}/{MAX_REINVOKES})...")
+              event["_Attempt"]=attempt+1
+              boto3.client("lambda").invoke(FunctionName=ctx.function_name,InvocationType="Event",Payload=json.dumps(event))
+            else:
+              L.error(f"Max reinvokes reached: {reason}")
+              send_cfn(event,ctx,"FAILED",reason=reason)
+          def handler(event,ctx):
+            global _CTX;_CTX=ctx
+            L.info(json.dumps(event,default=str))
+            rt=event["RequestType"];props=event["ResourceProperties"]
+            # For Delete: clean up K8s resources and wait for NLB removal before signaling SUCCESS
+            if rt=="Delete":
+              try:
+                cn=props["ClusterName"];region=props.get("Region",boto3.session.Session().region_name)
+                sess=boto3.Session(region_name=region)
+                eks=sess.client("eks");ci=eks.describe_cluster(name=cn)["cluster"]
+                ep=ci["endpoint"];ca=ci["certificateAuthority"]["data"]
+                tf=tempfile.NamedTemporaryFile(delete=False,suffix=".crt")
+                tf.write(base64.b64decode(ca));tf.flush();tf.close()
+                http=urllib3.PoolManager(cert_reqs="CERT_REQUIRED",ca_certs=tf.name,timeout=urllib3.Timeout(connect=10,read=10))
+                token=get_token(sess,cn,region)
+                manifests=props.get("Manifests",[])
+                if isinstance(manifests,str):manifests=json.loads(manifests)
+                for m in reversed(manifests):
+                  a,s=k8s_delete(http,ep,token,m)
+                  lbl=f"{m.get('kind')}/{m.get('metadata',{}).get('name')}"
+                  L.info(f"{a} {lbl} HTTP {s}")
+                # Wait for NLB to be fully deprovisioned (Gateway deletion triggers async NLB removal)
+                ns_val=props.get("Namespace","")
+                for wait_att in range(60):
+                  if ctx.get_remaining_time_in_millis()<30000:break
+                  token=get_token(sess,cn,region)
+                  hd_base={"Authorization":f"Bearer {token}","Accept":"application/json"}
+                  found_lb=False
+                  for search_ns in ["envoy-gateway-system",ns_val]:
+                    if not search_ns:continue
+                    r=http.request("GET",f"{ep}/api/v1/namespaces/{search_ns}/services",headers=hd_base)
+                    if r.status==200:
+                      svcs=json.loads(r.data.decode())
+                      for svc in svcs.get("items",[]):
+                        if svc.get("spec",{}).get("type")=="LoadBalancer":
+                          found_lb=True;break
+                    if found_lb:break
+                  if not found_lb:L.info("No LoadBalancer services remaining");break
+                  L.info(f"Waiting for LB services to be removed, attempt {wait_att+1}");time.sleep(10)
+              except Exception as de:
+                L.warning(f"Delete cleanup (non-fatal): {de}")
+              send_cfn(event,ctx,"SUCCESS",pid=event.get("PhysicalResourceId",ctx.log_stream_name))
+              return
+            try:
+              cn=props["ClusterName"];region=props.get("Region",boto3.session.Session().region_name)
+              sess=boto3.Session(region_name=region)
+              eks=sess.client("eks");ci=eks.describe_cluster(name=cn)["cluster"]
+              ep=ci["endpoint"];ca=ci["certificateAuthority"]["data"]
+              tf=tempfile.NamedTemporaryFile(delete=False,suffix=".crt")
+              tf.write(base64.b64decode(ca));tf.flush();tf.close()
+              http=urllib3.PoolManager(cert_reqs="CERT_REQUIRED",ca_certs=tf.name)
+              token=get_token(sess,cn,region)
+              # --- Verify all EKS addons are ACTIVE before proceeding ---
+              if rt=="Create":
+                L.info("Checking EKS addon health...")
+                try:
+                  addon_names=eks.list_addons(clusterName=cn).get("addons",[])
+                  core_addons={"vpc-cni","coredns","kube-proxy","eks-pod-identity-agent"}
+                  addon_names=[a for a in addon_names if a in core_addons]
+                  L.info(f"Addons: {addon_names}")
+                  for addon_att in range(360):
+                    if not has_time(300):break  # Leave 5min for manifest apply
+                    unhealthy=[]
+                    for addon in addon_names:
+                      try:
+                        ad=eks.describe_addon(clusterName=cn,addonName=addon)["addon"]
+                        st=ad.get("status","")
+                        if st!="ACTIVE":
+                          issues=[i.get("message","") for i in ad.get("health",{}).get("issues",[])]
+                          L.warning(f"Addon {addon}: {st} issues={issues}")
+                          unhealthy.append(f"{addon}:{st}")
+                      except Exception as ae:L.warning(f"describe_addon {addon}: {ae}")
+                    if not unhealthy:
+                      L.info("All addons ACTIVE");break
+                    L.info(f"Unhealthy addons: {unhealthy}, attempt {addon_att+1}");time.sleep(10)
+                  if unhealthy:L.warning(f"Proceeding with unhealthy addons: {unhealthy}")
+                except Exception as ae2:L.warning(f"Addon health check failed (non-fatal): {ae2}")
+              # --- Restart deployments to pick up Pod Identity credentials ---
+              restart_list=props.get("RestartDeployments","")
+              if restart_list and rt=="Create":
+                token=get_token(sess,cn,region)
+                hd_p={"Authorization":f"Bearer {token}","Content-Type":"application/strategic-merge-patch+json","Accept":"application/json"}
+                for item in restart_list.split(","):
+                  rns,rname=item.strip().split("/",1)
+                  patch=json.dumps({"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())}}}}}).encode()
+                  r=http.request("PATCH",f"{ep}/apis/apps/v1/namespaces/{rns}/deployments/{rname}",headers=hd_p,body=patch)
+                  L.info(f"Restart {item}: HTTP {r.status}")
+              manifests=props.get("Manifests",[])
+              if isinstance(manifests,str):manifests=json.loads(manifests)
+              manifests=coerce_ints(manifests)
+              # --- Create default-tags NodeClass from default + user tags ---
+              nc_tags_raw=props.get("NodeClassTags","")
+              if nc_tags_raw and rt in("Create","Update"):
+                try:
+                  nc_tags=json.loads(nc_tags_raw) if isinstance(nc_tags_raw,str) else nc_tags_raw
+                  if not isinstance(nc_tags,dict):nc_tags={}
+                  token=get_token(sess,cn,region)
+                  # Wait for default NodeClass to exist and be Ready
+                  for nca in range(300):
+                    if not has_time(120):break
+                    nc_s,nc_d=k8s_get(http,ep,token,"eks.amazonaws.com/v1","NodeClass","default")
+                    if nc_s==200:
+                      nc_conds={c["type"]:c["status"] for c in nc_d.get("status",{}).get("conditions",[])}
+                      if nc_conds.get("Ready")=="True":break
+                    L.info(f"Waiting for default NodeClass Ready, attempt {nca+1}");time.sleep(1)
+                  if nc_s==200:
+                    nc_new={"apiVersion":"eks.amazonaws.com/v1","kind":"NodeClass","metadata":{"name":"default-tags"},"spec":nc_d.get("spec",{})}
+                    if nc_tags:nc_new["spec"]["tags"]=nc_tags
+                    a,s,d=k8s_apply(http,ep,token,nc_new)
+                    L.info(f"NodeClass/default-tags: {a} HTTP {s}")
+                    # Wait for default-tags to become Ready
+                    for ncr in range(300):
+                      if not has_time(120):break
+                      nct_s,nct_d=k8s_get(http,ep,token,"eks.amazonaws.com/v1","NodeClass","default-tags")
+                      if nct_s==200:
+                        nct_conds={c["type"]:c["status"] for c in nct_d.get("status",{}).get("conditions",[])}
+                        if nct_conds.get("Ready")=="True":L.info("NodeClass/default-tags is Ready!");break
+                      L.info(f"Waiting for default-tags Ready, attempt {ncr+1}");time.sleep(1)
+                  else:
+                    L.warning(f"default NodeClass not found (HTTP {nc_s}), skipping default-tags creation")
+                except Exception as nce:
+                  L.warning(f"NodeClass setup error: {nce}")
+              results=[]
+              if rt in("Create","Update"):
+                # Refresh token (may have expired during addon wait)
+                token=get_token(sess,cn,region)
+                for m in manifests:
+                  a,s,d=k8s_apply(http,ep,token,m)
+                  lbl=f"{m.get('kind')}/{m.get('metadata',{}).get('name')}"
+                  L.info(f"{a} {lbl} HTTP {s}")
+                  results.append({"r":lbl,"a":a,"s":s,"d":d} if a=="error" else {"r":lbl,"a":a,"s":s})
+                  if a=="error":L.error(f"Error on {lbl}: {json.dumps(d)}")
+              errs=[r for r in results if r["a"]=="error"]
+              if errs:
+                e0=errs[0];msg=f"{e0['r']} HTTP {e0['s']} retries={e0.get('d',{}).get('retries','?')}: {e0.get('d',{}).get('message','unknown')}"
+                if len(errs)>1:msg+=f" (+{len(errs)-1} more)"
+                send_cfn(event,ctx,"FAILED",reason=msg[:256]);return
+              # Optional post-apply sleep (e.g. wait for NodePools to register)
+              sleep_secs=int(props.get("PostApplySleep","0"))
+              if sleep_secs>0:
+                L.info(f"PostApplySleep: waiting {sleep_secs}s");time.sleep(sleep_secs)
+              # Built-in system NodePool kept - Karpenter controller depends on it for scheduling
+              env_id=props.get("EnvironmentId",cn.split("-")[-1] if "-" in cn else "001")
+              ns_val=props.get("Namespace",f"cnf-{env_id}")
+              hd_base={"Authorization":f"Bearer {token}","Accept":"application/json"}
+              nlb_dns="";nlb_arn=""
+              if rt=="Create" and not props.get("PostApplySleep"):
+                # --- Wait for at least 1 Ready node ---
+                L.info("Waiting for at least 1 Ready node...")
+                node_ready=False
+                for nd_att in range(360):
+                  if not has_time(120):break
+                  token=get_token(sess,cn,region)
+                  hd_base={"Authorization":f"Bearer {token}","Accept":"application/json"}
+                  r_nodes=http.request("GET",f"{ep}/api/v1/nodes",headers=hd_base)
+                  if r_nodes.status==200:
+                    nd=json.loads(r_nodes.data.decode())
+                    for node in nd.get("items",[]):
+                      conds={c["type"]:c["status"] for c in node.get("status",{}).get("conditions",[])}
+                      if conds.get("Ready")=="True":
+                        L.info(f"Node ready: {node['metadata']['name']}");node_ready=True;break
+                  if node_ready:break
+                  L.info(f"No Ready nodes yet, attempt {nd_att+1}");time.sleep(10)
+                if not node_ready:
+                  reinvoke_or_fail(event,ctx,"No Ready nodes before timeout");return
+                # --- Wait for NLB hostname on envoy service ---
+                # (EnvoyGateway pods are guaranteed Ready by InstallEnvoyGateway step)
+                L.info("Waiting for NLB hostname on envoy service...")
+                for lb_att in range(360):
+                  if not has_time(120):break
+                  token=get_token(sess,cn,region)
+                  hd_base={"Authorization":f"Bearer {token}","Accept":"application/json"}
+                  for search_ns in ["envoy-gateway-system",ns_val]:
+                    r_svcs=http.request("GET",f"{ep}/api/v1/namespaces/{search_ns}/services",headers=hd_base)
+                    if r_svcs.status==200:
+                      svcs=json.loads(r_svcs.data.decode())
+                      for svc in svcs.get("items",[]):
+                        sn=svc.get("metadata",{}).get("name","")
+                        if "envoy" in sn:
+                          ingress=svc.get("status",{}).get("loadBalancer",{}).get("ingress",[])
+                          if ingress:
+                            nlb_dns=ingress[0].get("hostname","")
+                            L.info(f"NLB DNS: {nlb_dns} on svc {sn} in ns {search_ns}");break
+                    if nlb_dns:break
+                  if nlb_dns:break
+                  L.info(f"NLB not ready yet, attempt {lb_att+1}");time.sleep(10)
+                if not nlb_dns:
+                  reinvoke_or_fail(event,ctx,"NLB hostname not assigned before timeout");return
+                # Resolve NLB ARN
+                try:
+                  elb=sess.client("elbv2")
+                  for lb in elb.describe_load_balancers().get("LoadBalancers",[]):
+                    if lb.get("DNSName","")==nlb_dns:nlb_arn=lb["LoadBalancerArn"];break
+                except Exception as ea:L.warning(f"NLB ARN lookup: {ea}")
+              send_cfn(event,ctx,"SUCCESS",data={"Result":json.dumps(results[:5]),"NlbDns":nlb_dns,"NlbArn":nlb_arn},pid=f"{cn}-k8s-{event['LogicalResourceId']}")
+            except Exception as e:
+              L.exception("fail")
+              send_cfn(event,ctx,"FAILED",reason=str(e)[:256])
+
+  # ============================================================================
+  # SECTION 6: COGNITO USER POOL + OIDC
+  # ============================================================================
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    DependsOn: QuotaCheck
+    Properties:
+      UserPoolName: !Sub "${ProjectName}${EnvironmentId}"
+      UserPoolTier: ESSENTIALS
+      AutoVerifiedAttributes:
+        - email
+      AliasAttributes:
+        - email
+      UsernameConfiguration:
+        CaseSensitive: false
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+        - Name: name
+          Required: true
+          Mutable: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub "cnf-${EnvironmentId}-${AWS::AccountId}"
+      ManagedLoginVersion: 2
+      UserPoolId: !Ref CognitoUserPool
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: CognitoUserPoolDomain
+    Properties:
+      ClientName: !Sub "${ProjectName}${EnvironmentId}-app"
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: true
+      ExplicitAuthFlows:
+        - ALLOW_USER_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - openid
+        - profile
+        - email
+        - phone
+      SupportedIdentityProviders:
+        - COGNITO
+      CallbackURLs:
+        - !Sub "https://${CloudFrontDistribution.DomainName}${AppRootPath}/auth/oidc/callback"
+      LogoutURLs:
+        - !Sub "https://${CloudFrontDistribution.DomainName}${AppRootPath}/auth/oidc/logout"
+
+  CognitoManagedLoginBranding:
+    Type: AWS::Cognito::ManagedLoginBranding
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ClientId: !Ref CognitoUserPoolClient
+      UseCognitoProvidedValues: true
+
+
+  # --- LiteLLM Cognito App Client (separate SSO client) ---
+  LiteLLMCognitoClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: CognitoUserPoolDomain
+    Properties:
+      ClientName: !Sub "${ProjectName}${EnvironmentId}-litellm"
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: true
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - openid
+        - profile
+        - email
+      SupportedIdentityProviders:
+        - COGNITO
+      CallbackURLs:
+        - !Sub "https://${CloudFrontDistribution.DomainName}/sso/callback"
+        - !Sub "https://${GlobalAccelerator.DualStackDnsName}/sso/callback"
+      LogoutURLs:
+        - !Sub "https://${CloudFrontDistribution.DomainName}/ui/"
+        - !Sub "https://${GlobalAccelerator.DualStackDnsName}/ui/"
+
+  LiteLLMManagedLoginBranding:
+    Type: AWS::Cognito::ManagedLoginBranding
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ClientId: !Ref LiteLLMCognitoClient
+      UseCognitoProvidedValues: true
+  # Pre Token Generation Lambda: maps cognito:groups → groups claim in JWT
+  CognitoPreTokenGenFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: QuotaCheck
+    Properties:
+      FunctionName: !Sub "${ProjectName}${EnvironmentId}-cognito-pre-token-gen"
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Timeout: 5
+      MemorySize: 128
+      Role: !GetAtt KubectlLambdaRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            const groups = event.request?.groupConfiguration?.groupsToOverride ?? [];
+            event.response = {
+              claimsAndScopeOverrideDetails: {
+                accessTokenGeneration: { claimsToAddOrOverride: { groups } },
+                idTokenGeneration: { claimsToAddOrOverride: { groups } },
+              },
+            };
+            return event;
+          };
+
+  CognitoPreTokenGenPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CognitoPreTokenGenFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt CognitoUserPool.Arn
+
+  CognitoUserPoolLambdaConfig:
+    Type: Custom::CognitoLambdaConfig
+    DependsOn:
+      - CognitoPreTokenGenPermission
+    Properties:
+      ServiceToken: !GetAtt CognitoLambdaConfigFunction.Arn
+      UserPoolId: !Ref CognitoUserPool
+      LambdaArn: !GetAtt CognitoPreTokenGenFunction.Arn
+      Region: !Ref "AWS::Region"
+
+  CognitoLambdaConfigFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: QuotaCheck
+    Properties:
+      FunctionName: !Sub "${ProjectName}${EnvironmentId}-cognito-lambda-config"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 128
+      Role: !GetAtt KubectlLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json,logging,boto3,urllib3
+          L=logging.getLogger();L.setLevel(logging.INFO)
+          def send_cfn(event,ctx,status,reason=None):
+            body=json.dumps({"Status":status,"Reason":reason or f"Logs: {ctx.log_stream_name}",
+              "PhysicalResourceId":event.get("PhysicalResourceId",ctx.log_stream_name),
+              "StackId":event["StackId"],"RequestId":event["RequestId"],
+              "LogicalResourceId":event["LogicalResourceId"],"Data":{}})
+            urllib3.PoolManager().request("PUT",event["ResponseURL"],body=body.encode(),headers={"Content-Type":""})
+          def handler(event,ctx):
+            L.info(json.dumps(event,default=str))
+            props=event["ResourceProperties"]
+            pool_id=props["UserPoolId"];region=props.get("Region",boto3.session.Session().region_name)
+            cog=boto3.client("cognito-idp",region_name=region)
+            try:
+              # Describe current pool to preserve existing settings
+              pool=cog.describe_user_pool(UserPoolId=pool_id)['UserPool']
+              lc=pool.get('LambdaConfig',{})
+              if event["RequestType"]=="Delete":
+                lc.pop('PreTokenGeneration',None);lc.pop('PreTokenGenerationConfig',None)
+              else:
+                lc['PreTokenGenerationConfig']={"LambdaArn":props["LambdaArn"],"LambdaVersion":"V3_0"}
+              cog.update_user_pool(UserPoolId=pool_id,LambdaConfig=lc)
+              send_cfn(event,ctx,"SUCCESS")
+            except Exception as e:
+              L.exception("fail");send_cfn(event,ctx,"FAILED",reason=str(e)[:256])
+
+  CognitoAdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: admin
+      UserPoolId: !Ref CognitoUserPool
+      Description: Administrator group
+
+  # Lambda to create Cognito admin user
+  CognitoUserCreatorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: QuotaCheck
+    Properties:
+      FunctionName: !Sub "${ProjectName}${EnvironmentId}-cognito-user-creator"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 128
+      Role: !GetAtt KubectlLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json,logging,boto3,secrets,string,urllib3
+          L=logging.getLogger();L.setLevel(logging.INFO)
+          def gen_pwd(length=16):
+            chars=string.ascii_letters+string.digits+"!@#$%^&*()"
+            while True:
+              pwd=''.join(secrets.choice(chars) for _ in range(length))
+              if (any(c.islower() for c in pwd) and any(c.isupper() for c in pwd) and 
+                  any(c.isdigit() for c in pwd) and any(c in "!@#$%^&*()" for c in pwd)):
+                return pwd
+          def send_cfn(event,ctx,status,data=None,reason=None,pid=None):
+            body=json.dumps({"Status":status,"Reason":reason or f"Logs: {ctx.log_stream_name}",
+              "PhysicalResourceId":pid or event.get("PhysicalResourceId",ctx.log_stream_name),
+              "StackId":event["StackId"],"RequestId":event["RequestId"],
+              "LogicalResourceId":event["LogicalResourceId"],"Data":data or {}})
+            urllib3.PoolManager().request("PUT",event["ResponseURL"],body=body.encode(),headers={"Content-Type":""})
+          def handler(event,ctx):
+            L.info(json.dumps(event,default=str))
+            rt=event["RequestType"];props=event["ResourceProperties"]
+            if rt=="Delete":
+              send_cfn(event,ctx,"SUCCESS",pid="cognito-admin-user");return
+            try:
+              pool_id=props["UserPoolId"];username=props.get("Username","admin@example.com")
+              region=props.get("Region",boto3.session.Session().region_name)
+              cog=boto3.client("cognito-idp",region_name=region)
+              password=gen_pwd(16)
+              uname=username.split("@")[0]
+              try:
+                cog.admin_create_user(UserPoolId=pool_id,Username=uname,
+                  TemporaryPassword=password,MessageAction="SUPPRESS",
+                  UserAttributes=[{"Name":"email","Value":username},
+                    {"Name":"email_verified","Value":"true"},
+                    {"Name":"name","Value":uname.replace("."," ").title()}])
+                L.info(f"Created user {username}")
+              except cog.exceptions.UsernameExistsException:
+                L.info(f"User {uname} already exists, resetting password")
+              cog.admin_set_user_password(UserPoolId=pool_id,Username=uname,
+                Password=password,Permanent=True)
+              L.info(f"Set permanent password for {uname}")
+              group=props.get("GroupName")
+              if group:
+                cog.admin_add_user_to_group(UserPoolId=pool_id,Username=uname,GroupName=group)
+                L.info(f"Added {uname} to group {group}")
+              send_cfn(event,ctx,"SUCCESS",data={"Username":username,"Password":password},pid="cognito-admin-user")
+            except Exception as e:
+              L.exception("fail");send_cfn(event,ctx,"FAILED",reason=str(e)[:256])
+
+  CognitoAdminUser:
+    Type: Custom::CognitoUser
+    DependsOn:
+      - CognitoUserPool
+      - CognitoAdminGroup
+    Properties:
+      ServiceToken: !GetAtt CognitoUserCreatorFunction.Arn
+      UserPoolId: !Ref CognitoUserPool
+      Username: admin@example.aws
+      GroupName: admin
+      Region: !Ref "AWS::Region"
+
+  # ============================================================================
+  # SECTION 7: KUBERNETES RESOURCES - EnvoyGateway + Gateway + App Resources
+  # ============================================================================
+
+  # Lambda to install EnvoyGateway via Helm
+  EnvoyGatewayInstaller:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - LambdaAccessEntry
+      - ClusterSGIngressFromLambda
+      - AddonCoreDns
+      - AddonKubeProxy
+      - AddonMetricsServer
+    Properties:
+      FunctionName: !Sub "${ProjectName}${EnvironmentId}-eg-installer"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 900
+      MemorySize: 1024
+      Role: !GetAtt KubectlLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import base64,json,logging,os,platform,subprocess,tarfile,tempfile,time,urllib3,boto3
+          from botocore.signers import RequestSigner
+          L=logging.getLogger();L.setLevel(logging.INFO)
+          HELM_VER="v3.17.3"
+          def get_token(sess,cluster,region):
+            sts=sess.client("sts",region_name=region);si=sts.meta.service_model.service_id
+            sg=RequestSigner(si,region,"sts","v4",sess.get_credentials(),sess.events)
+            p={"method":"GET","url":f"https://sts.{region}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15","body":{},"headers":{"x-k8s-aws-id":cluster},"context":{}}
+            u=sg.generate_presigned_url(p,region_name=region,expires_in=900,operation_name="")
+            return "k8s-aws-v1."+base64.urlsafe_b64encode(u.encode()).decode().rstrip("=")
+          def write_kubeconfig(path,ep,ca,cn,token):
+            kc={"apiVersion":"v1","kind":"Config","clusters":[{"name":cn,"cluster":{"server":ep,"certificate-authority-data":ca}}],"users":[{"name":"lambda","user":{"token":token}}],"contexts":[{"name":"ctx","context":{"cluster":cn,"user":"lambda"}}],"current-context":"ctx"}
+            open(path,"w").write(json.dumps(kc))
+          def get_helm(d):
+            arch="arm64" if platform.machine()=="aarch64" else "amd64"
+            url=f"https://get.helm.sh/helm-{HELM_VER}-linux-{arch}.tar.gz"
+            L.info(f"Downloading helm {HELM_VER} {arch}...")
+            r=urllib3.PoolManager().request("GET",url,redirect=True,timeout=120)
+            if r.status!=200:raise RuntimeError(f"Helm download HTTP {r.status}")
+            tgz=os.path.join(d,"helm.tgz");open(tgz,"wb").write(r.data)
+            with tarfile.open(tgz,"r:gz") as t:
+              for m in t.getmembers():
+                if m.name.endswith("/helm"):m.name="helm";t.extract(m,d);break
+            hp=os.path.join(d,"helm");os.chmod(hp,0o755);return hp
+          def helm_run(cmd,env):
+            L.info("helm "+" ".join(cmd[1:]))
+            r=subprocess.run(cmd,capture_output=True,text=True,env=env)
+            if r.stdout:L.info(r.stdout[:3000])
+            if r.stderr:L.info(r.stderr[:3000])
+            return r
+          def send_cfn(event,ctx,status,data=None,reason=None,pid=None):
+            body=json.dumps({"Status":status,"Reason":reason or ctx.log_stream_name,"PhysicalResourceId":pid or event.get("PhysicalResourceId",ctx.log_stream_name),"StackId":event["StackId"],"RequestId":event["RequestId"],"LogicalResourceId":event["LogicalResourceId"],"Data":data or {}})
+            urllib3.PoolManager().request("PUT",event["ResponseURL"],body=body.encode(),headers={"Content-Type":""})
+          def handler(event,ctx):
+            L.info(json.dumps(event,default=str))
+            rt=event["RequestType"];props=event["ResourceProperties"]
+            cn=props["ClusterName"];region=props.get("Region",boto3.session.Session().region_name)
+            version=props.get("Version","v1.7.1")
+            sess=boto3.Session(region_name=region)
+            eks=sess.client("eks");ci=eks.describe_cluster(name=cn)["cluster"]
+            ep=ci["endpoint"];ca=ci["certificateAuthority"]["data"]
+            d=tempfile.mkdtemp()
+            ca_path=os.path.join(d,"ca.crt");open(ca_path,"wb").write(base64.b64decode(ca))
+            http=urllib3.PoolManager(cert_reqs="CERT_REQUIRED",ca_certs=ca_path,timeout=urllib3.Timeout(connect=10,read=30))
+            kc=os.path.join(d,"kubeconfig")
+            try:
+              hp=get_helm(d)
+              env={**os.environ,"KUBECONFIG":kc,"HELM_CACHE_HOME":d,"HELM_CONFIG_HOME":d,"HELM_DATA_HOME":d}
+              if rt=="Delete":
+                token=get_token(sess,cn,region);write_kubeconfig(kc,ep,ca,cn,token)
+                helm_run([hp,"uninstall","eg","-n","envoy-gateway-system","--ignore-not-found"],env)
+                for w in range(60):
+                  if ctx.get_remaining_time_in_millis()<30000:break
+                  token=get_token(sess,cn,region)
+                  r=http.request("GET",f"{ep}/api/v1/namespaces/envoy-gateway-system",headers={"Authorization":f"Bearer {token}","Accept":"application/json"})
+                  if r.status==404:L.info("envoy-gateway-system removed");break
+                  L.info(f"Waiting ns delete attempt {w+1}");time.sleep(10)
+                send_cfn(event,ctx,"SUCCESS",pid=event.get("PhysicalResourceId",ctx.log_stream_name));return
+              # Create / Update
+              token=get_token(sess,cn,region);write_kubeconfig(kc,ep,ca,cn,token)
+              L.info(f"helm upgrade --install eg oci://docker.io/envoyproxy/gateway-helm {version}")
+              r=helm_run([hp,"upgrade","--install","eg","oci://docker.io/envoyproxy/gateway-helm","--version",version,"-n","envoy-gateway-system","--create-namespace"],env)
+              if r.returncode!=0:
+                send_cfn(event,ctx,"FAILED",reason=f"helm failed: {(r.stderr or r.stdout)[:256]}");return
+              # Wait for all envoy-gateway pods to be Running and Ready before signalling SUCCESS
+              L.info("Waiting for envoy-gateway pods to be Ready...")
+              ready=False
+              for att in range(360):
+                if ctx.get_remaining_time_in_millis()<60000:L.warning("Lambda timeout approaching");break
+                token=get_token(sess,cn,region)
+                r=http.request("GET",f"{ep}/api/v1/namespaces/envoy-gateway-system/pods",headers={"Authorization":f"Bearer {token}","Accept":"application/json"})
+                if r.status==200:
+                  items=json.loads(r.data.decode()).get("items",[])
+                  rdy=[p for p in items if p.get("status",{}).get("phase")=="Running" and all(c.get("ready") for c in p.get("status",{}).get("containerStatuses",[{}]))]
+                  L.info(f"EG pods: {len(items)} total, {len(rdy)} Ready (attempt {att+1})")
+                  if rdy:ready=True;break
+                time.sleep(10)
+              if not ready:
+                send_cfn(event,ctx,"FAILED",reason="EnvoyGateway pods did not become Ready within timeout");return
+              send_cfn(event,ctx,"SUCCESS",data={"Version":version},pid=f"{cn}-envoy-gateway")
+            except Exception as e:
+              L.exception("fail");send_cfn(event,ctx,"FAILED",reason=str(e)[:256])
+
+  # Custom Resource: Install EnvoyGateway
+  InstallEnvoyGateway:
+    Type: Custom::EnvoyGatewayInstall
+    DependsOn:
+      - AddonCoreDns
+      - AddonKubeProxy
+      - AddonVpcCni
+      - AddonPodIdentity
+    Properties:
+      ServiceToken: !GetAtt EnvoyGatewayInstaller.Arn
+      ClusterName: !Ref EksCluster
+      Region: !Ref "AWS::Region"
+      Version: !Ref EnvoyGatewayVersion
+
+  # Custom Resource: Create namespace, GatewayClass, EnvoyProxy, Gateway
+  K8sInfraResources:
+    Type: Custom::K8sInfra
+    DependsOn:
+      - InstallEnvoyGateway
+      - EfsCsiPodIdentityAssoc
+      - K8sNodePools
+    Properties:
+      ServiceToken: !GetAtt KubectlFunction.Arn
+      RestartDeployments: "kube-system/efs-csi-controller"
+      ClusterName: !Ref EksCluster
+      Region: !Ref "AWS::Region"
+      Manifests:
+        # --- GatewayClass ---
+        - apiVersion: gateway.networking.k8s.io/v1
+          kind: GatewayClass
+          metadata:
+            name: !Sub "cnf-${EnvironmentId}-eg"
+          spec:
+            controllerName: gateway.envoyproxy.io/gatewayclass-controller
+            parametersRef:
+              group: gateway.envoyproxy.io
+              kind: EnvoyProxy
+              name: custom-proxy-config
+              namespace: envoy-gateway-system
+        # --- EnvoyProxy (custom config for IPv6 + NLB) ---
+        - apiVersion: gateway.envoyproxy.io/v1alpha1
+          kind: EnvoyProxy
+          metadata:
+            name: custom-proxy-config
+            namespace: envoy-gateway-system
+          spec:
+            ipFamily: IPv6
+            logging:
+              level:
+                default: warn
+            provider:
+              type: Kubernetes
+              kubernetes:
+                envoyDeployment:
+                  container:
+                    resources:
+                      requests:
+                        cpu: "200m"
+                        memory: "512Mi"
+                      limits:
+                        cpu: "2"
+                        memory: "1Gi"
+                  strategy:
+                    type: RollingUpdate
+                    rollingUpdate:
+                      maxUnavailable: 0
+                      maxSurge: 1
+                envoyHpa:
+                  minReplicas: 1
+                  maxReplicas: 500
+                  metrics:
+                    - type: Resource
+                      resource:
+                        name: cpu
+                        target:
+                          type: Utilization
+                          averageUtilization: 60
+                    - type: Resource
+                      resource:
+                        name: memory
+                        target:
+                          type: AverageValue
+                          averageValue: "400Mi"
+                  behavior:
+                    scaleUp:
+                      stabilizationWindowSeconds: 30
+                      policies:
+                        - type: Pods
+                          value: 2
+                          periodSeconds: 60
+                    scaleDown:
+                      stabilizationWindowSeconds: 300
+                      policies:
+                        - type: Pods
+                          value: 1
+                          periodSeconds: 120
+                envoyService:
+                  type: LoadBalancer
+                  annotations:
+                    # internal scheme: the NLB has private IPs only (no public IPs).
+                    # External traffic flows: CloudFront (VPC Origin -> internal
+                    # ALB) / Global Accelerator (-> internal NLB) -> Envoy. This
+                    # eliminates direct public-IP exposure of the gateway, so no
+                    # one can bypass CloudFront/GA by hitting the LB DNS directly.
+                    # dualstack: required because the EKS cluster is IPv6 (pod IPs
+                    # are IPv6 only), so the NLB target group must support IPv6.
+                    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+                    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+                    service.beta.kubernetes.io/aws-load-balancer-ip-address-type: dualstack
+                    service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
+                    service.beta.kubernetes.io/aws-load-balancer-enable-prefix-for-ipv6-source-nat: "on"
+                    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "10080"
+                  externalTrafficPolicy: Local
+        # --- Gateway (HTTP:80 + HTTPS:443) ---
+        - apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata:
+            name: eg
+            namespace: envoy-gateway-system
+            annotations:
+              cert-manager.io/cluster-issuer: letsencrypt-gateway
+          spec:
+            gatewayClassName: !Sub "cnf-${EnvironmentId}-eg"
+            infrastructure:
+              parametersRef:
+                group: gateway.envoyproxy.io
+                kind: EnvoyProxy
+                name: custom-proxy-config
+            listeners:
+              - name: http
+                port: 80
+                protocol: HTTP
+                allowedRoutes:
+                  namespaces:
+                    from: All
+              - name: https
+                port: 443
+                protocol: HTTPS
+                allowedRoutes:
+                  namespaces:
+                    from: All
+                tls:
+                  mode: Terminate
+                  certificateRefs:
+                    - kind: Secret
+                      name: ga-https-cert
+                    - kind: Secret
+                      name: eg-https-cert
+        # --- StorageClass (EFS with uid/gid 1000) ---
+        - apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: efs-sc
+            annotations:
+              storageclass.kubernetes.io/is-default-class: "true"
+          provisioner: efs.csi.aws.com
+          reclaimPolicy: Delete
+          volumeBindingMode: WaitForFirstConsumer
+          parameters:
+            fileSystemId: !Ref EfsFileSystem
+            provisioningMode: efs-ap
+            directoryPerms: "0700"
+            gid: "1000"
+            uid: "1000"
+        # --- ClusterIssuer for Let's Encrypt HTTP-01 ---
+        - apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: letsencrypt-gateway
+          spec:
+            acme:
+              server: https://acme-v02.api.letsencrypt.org/directory
+              email: !Sub "admin@${ProjectName}${EnvironmentId}.noreply.example.com"
+              privateKeySecretRef:
+                name: letsencrypt-gateway-account-key
+              solvers:
+                - http01:
+                    gatewayHTTPRoute:
+                      parentRefs:
+                        - name: eg
+                          namespace: envoy-gateway-system
+                          kind: Gateway
+        # --- ClusterIP Service for ALB target (selects the Envoy proxy pods) ---
+        # CloudFront reaches the internal NLB indirectly: it uses a VPC Origin
+        # that points at an internal ALB, and the ALB targets these Envoy pods.
+        # Selectors match the labels Envoy Gateway puts on its proxy pods.
+        # IPv6 SingleStack matches the IPv6 cluster's pod IPs.
+        - apiVersion: v1
+          kind: Service
+          metadata:
+            name: envoy-cf-backend
+            namespace: envoy-gateway-system
+          spec:
+            type: ClusterIP
+            ipFamilyPolicy: SingleStack
+            ipFamilies:
+              - IPv6
+            selector:
+              app.kubernetes.io/component: proxy
+              app.kubernetes.io/managed-by: envoy-gateway
+              app.kubernetes.io/name: envoy
+              gateway.envoyproxy.io/owning-gateway-name: eg
+              gateway.envoyproxy.io/owning-gateway-namespace: envoy-gateway-system
+            ports:
+              - name: http
+                port: 80
+                targetPort: 10080
+                protocol: TCP
+        # --- IngressClass for EKS Auto Mode's built-in AWS LB controller ---
+        - apiVersion: networking.k8s.io/v1
+          kind: IngressClass
+          metadata:
+            name: alb
+          spec:
+            controller: eks.amazonaws.com/alb
+        # --- Ingress -> AWS LB Controller creates an internal dualstack ALB ---
+        # CloudFront VPC Origin points at this ALB. Dualstack so the IPv6 backend
+        # (Envoy pods) is reachable while CloudFront's managed ENI uses an IPv4
+        # listener. This ALB is internal (no public IP).
+        - apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: cf-vpc-origin
+            namespace: envoy-gateway-system
+            annotations:
+              alb.ingress.kubernetes.io/scheme: internal
+              alb.ingress.kubernetes.io/ip-address-type: dualstack
+              alb.ingress.kubernetes.io/target-type: ip
+              alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+              alb.ingress.kubernetes.io/backend-protocol: HTTP
+              alb.ingress.kubernetes.io/backend-protocol-version: HTTP1
+              alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+              alb.ingress.kubernetes.io/healthcheck-port: traffic-port
+              alb.ingress.kubernetes.io/healthcheck-path: /
+              alb.ingress.kubernetes.io/success-codes: 200-499
+              alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=300,routing.http2.enabled=true
+              alb.ingress.kubernetes.io/security-groups: !Ref AlbSecurityGroup
+              alb.ingress.kubernetes.io/manage-backend-security-group-rules: "true"
+          spec:
+            ingressClassName: alb
+            rules:
+              - http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: envoy-cf-backend
+                          port:
+                            number: 80
+
+  # ============================================================================
+  # SECTION 8: CloudFront Distribution
+  # ============================================================================
+
+  # Lambda to get NLB DNS name from EKS Service
+  NlbLookupFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: QuotaCheck
+    Properties:
+      FunctionName: !Sub "${ProjectName}${EnvironmentId}-nlb-lookup"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 900
+      MemorySize: 256
+      Role: !GetAtt KubectlLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import base64,json,logging,tempfile,time,urllib3,boto3
+          from botocore.signers import RequestSigner
+          L=logging.getLogger();L.setLevel(logging.INFO)
+          MAX_REINVOKES=4
+          def get_token(sess,cluster,region):
+            sts=sess.client("sts",region_name=region);si=sts.meta.service_model.service_id
+            sg=RequestSigner(si,region,"sts","v4",sess.get_credentials(),sess.events)
+            p={"method":"GET","url":f"https://sts.{region}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15","body":{},"headers":{"x-k8s-aws-id":cluster},"context":{}}
+            u=sg.generate_presigned_url(p,region_name=region,expires_in=60,operation_name="")
+            return "k8s-aws-v1."+base64.urlsafe_b64encode(u.encode()).decode().rstrip("=")
+          def send_cfn(event,ctx,status,data=None,reason=None,pid=None):
+            body=json.dumps({"Status":status,"Reason":reason or f"Logs: {ctx.log_stream_name}","PhysicalResourceId":pid or event.get("PhysicalResourceId",ctx.log_stream_name),"StackId":event["StackId"],"RequestId":event["RequestId"],"LogicalResourceId":event["LogicalResourceId"],"Data":data or {}})
+            urllib3.PoolManager().request("PUT",event["ResponseURL"],body=body.encode(),headers={"Content-Type":""})
+          def handler(event,ctx):
+            L.info(json.dumps(event,default=str))
+            rt=event["RequestType"];props=event["ResourceProperties"]
+            if rt=="Delete":
+              send_cfn(event,ctx,"SUCCESS",pid="nlb-lookup");return
+            try:
+              cn=props["ClusterName"];ns=props["Namespace"]
+              region=props.get("Region",boto3.session.Session().region_name)
+              sess=boto3.Session(region_name=region)
+              required_port=int(props.get("RequiredPort",0))
+              # --- Mode: NLB Health Check (post-deploy) ---
+              if required_port and props.get("NlbArn"):
+                nlb_arn=props["NlbArn"]
+                elb=sess.client("elbv2")
+                eks=sess.client("eks");ci=eks.describe_cluster(name=cn)["cluster"]
+                ep=ci["endpoint"];ca=ci["certificateAuthority"]["data"]
+                tf=tempfile.NamedTemporaryFile(delete=False,suffix=".crt")
+                tf.write(base64.b64decode(ca));tf.flush();tf.close()
+                http=urllib3.PoolManager(cert_reqs="CERT_REQUIRED",ca_certs=tf.name)
+                for attempt in range(30):
+                  if ctx.get_remaining_time_in_millis()<60000:break
+                  listeners=elb.describe_listeners(LoadBalancerArn=nlb_arn)["Listeners"]
+                  ports=[l["Port"] for l in listeners]
+                  if required_port in ports:
+                    L.info(f"NLB port {required_port} listener OK (ports: {ports})")
+                    break
+                  L.warning(f"NLB port {required_port} missing (ports: {ports}), annotating envoy svc to trigger sync...")
+                  token=get_token(sess,cn,region)
+                  hd={"Authorization":f"Bearer {token}","Accept":"application/json","Content-Type":"application/merge-patch+json"}
+                  r=http.request("GET",f"{ep}/api/v1/namespaces/envoy-gateway-system/services",headers=hd)
+                  if r.status==200:
+                    for svc in json.loads(r.data.decode()).get("items",[]):
+                      if svc.get("spec",{}).get("type")=="LoadBalancer":
+                        sn=svc["metadata"]["name"]
+                        patch=json.dumps({"metadata":{"annotations":{"nlb-sync":str(time.time())}}}).encode()
+                        http.request("PATCH",f"{ep}/api/v1/namespaces/envoy-gateway-system/services/{sn}",headers=hd,body=patch)
+                        L.info(f"Annotated {sn} for NLB sync")
+                  time.sleep(20)
+                # Verify targets healthy
+                tgs=elb.describe_target_groups(LoadBalancerArn=nlb_arn)["TargetGroups"]
+                all_healthy=True
+                for tg in tgs:
+                  health=elb.describe_target_health(TargetGroupArn=tg["TargetGroupArn"])
+                  for t in health["TargetHealthDescriptions"]:
+                    if t["TargetHealth"]["State"]!="healthy":all_healthy=False
+                L.info(f"NLB health check done. All healthy: {all_healthy}")
+                send_cfn(event,ctx,"SUCCESS",data={"NlbDns":props.get("NlbDns",""),"NlbArn":nlb_arn,"HealthCheck":"passed" if all_healthy else "degraded"},pid="nlb-health-check")
+                return
+              # --- Mode: NLB Lookup (original) ---
+              svc_name=props.get("ServiceName","envoy-default-cnf")
+              eks=sess.client("eks");ci=eks.describe_cluster(name=cn)["cluster"]
+              ep=ci["endpoint"];ca=ci["certificateAuthority"]["data"]
+              tf=tempfile.NamedTemporaryFile(delete=False,suffix=".crt")
+              tf.write(base64.b64decode(ca));tf.flush();tf.close()
+              http=urllib3.PoolManager(cert_reqs="CERT_REQUIRED",ca_certs=tf.name)
+              token=get_token(sess,cn,region)
+              # Poll for LoadBalancer hostname (NLB can take a few minutes)
+              nlb_dns="";nlb_arn=""
+              for attempt in range(360):
+                if ctx.get_remaining_time_in_millis()<120000:break
+                token=get_token(sess,cn,region)
+                hd={"Authorization":f"Bearer {token}","Accept":"application/json"}
+                # List services in envoy-gateway-system and user namespace to find the envoy service
+                for search_ns in ["envoy-gateway-system",ns]:
+                  r=http.request("GET",f"{ep}/api/v1/namespaces/{search_ns}/services",headers=hd)
+                  if r.status==200:
+                    svcs=json.loads(r.data.decode())
+                    for svc in svcs.get("items",[]):
+                      sn=svc.get("metadata",{}).get("name","")
+                      # Match envoy gateway generated service names
+                      if "envoy" in sn:
+                        ingress=svc.get("status",{}).get("loadBalancer",{}).get("ingress",[])
+                        if ingress:
+                          nlb_dns=ingress[0].get("hostname","")
+                          L.info(f"Found NLB DNS: {nlb_dns} on service {sn} in ns {search_ns}")
+                          break
+                  if nlb_dns:break
+                if nlb_dns:break
+                L.info(f"Waiting for NLB... attempt {attempt+1}")
+                time.sleep(10)
+              if not nlb_dns:
+                # Fallback: read from props passed from K8sInfraResources
+                nlb_dns=props.get("NlbDns","")
+                nlb_arn=props.get("NlbArn","")
+              if not nlb_dns:
+                attempt=event.get("_Attempt",0)
+                if attempt<MAX_REINVOKES:
+                  L.info(f"NLB not found, reinvoking (attempt {attempt+1}/{MAX_REINVOKES})...")
+                  event["_Attempt"]=attempt+1
+                  boto3.client("lambda").invoke(FunctionName=ctx.function_name,InvocationType="Event",Payload=json.dumps(event))
+                  return
+                send_cfn(event,ctx,"FAILED",reason="NLB DNS not available after all retries");return
+              # Get NLB ARN from ELB API using DNS name
+              if not nlb_arn:
+                elb=sess.client("elbv2")
+                nlbs=elb.describe_load_balancers()
+                for lb in nlbs.get("LoadBalancers",[]):
+                  if lb.get("DNSName","")==nlb_dns:
+                    nlb_arn=lb["LoadBalancerArn"];break
+              send_cfn(event,ctx,"SUCCESS",data={"NlbDns":nlb_dns,"NlbArn":nlb_arn},pid="nlb-lookup")
+            except Exception as e:
+              L.exception("fail");send_cfn(event,ctx,"FAILED",reason=str(e)[:256])
+
+  NlbLookup:
+    Type: Custom::NlbLookup
+    DependsOn: K8sInfraResources
+    Properties:
+      ServiceToken: !GetAtt NlbLookupFunction.Arn
+      ClusterName: !Ref EksCluster
+      Namespace: !Sub "cnf-${EnvironmentId}"
+      Region: !Ref "AWS::Region"
+      NlbDns: !GetAtt K8sInfraResources.NlbDns
+      NlbArn: !GetAtt K8sInfraResources.NlbArn
+
+  # --- Security Group for the internal ALB used as CloudFront VPC Origin ---
+  # CloudFront connects from a service-managed ENI it creates inside the VPC's
+  # private subnet. That ENI gets a private IPv4 from the subnet's CIDR, so VPC
+  # CIDR ingress is the baseline; the SG-to-SG rule (CloudFrontSgIngress) is what
+  # actually authorizes CloudFront's traffic.
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn:
+      - QuotaCheck
+      - IPv6CidrBlock
+    Properties:
+      GroupDescription: !Sub "${ProjectName}${EnvironmentId} CloudFront VPC Origin ALB SG"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref VpcCidr
+          Description: "Allow HTTP IPv4 from VPC (CloudFront VPC Origin managed ENI)"
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIpv6: !Select [0, !GetAtt VPC.Ipv6CidrBlocks]
+          Description: "Allow HTTP IPv6 from VPC (CloudFront VPC Origin uses IPv6 if both ALB and managed ENI are dualstack)"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+          Description: "All egress IPv4 (ALB needs to reach IPv6 backend pods)"
+        - IpProtocol: "-1"
+          CidrIpv6: "::/0"
+          Description: "All egress IPv6 (Envoy pods are IPv6)"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-alb-vpcorigin-sg"
+
+  # Lambda to look up the ALB DNS / ARN created by the K8s Ingress
+  AlbLookupFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: QuotaCheck
+    Properties:
+      FunctionName: !Sub "${ProjectName}${EnvironmentId}-alb-lookup"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 900
+      MemorySize: 256
+      Role: !GetAtt KubectlLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import base64,json,logging,tempfile,time,urllib3,boto3
+          from botocore.signers import RequestSigner
+          L=logging.getLogger();L.setLevel(logging.INFO)
+          MAX_REINVOKES=4
+          def get_token(sess,cluster,region):
+            sts=sess.client("sts",region_name=region);si=sts.meta.service_model.service_id
+            sg=RequestSigner(si,region,"sts","v4",sess.get_credentials(),sess.events)
+            p={"method":"GET","url":f"https://sts.{region}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15","body":{},"headers":{"x-k8s-aws-id":cluster},"context":{}}
+            u=sg.generate_presigned_url(p,region_name=region,expires_in=60,operation_name="")
+            return "k8s-aws-v1."+base64.urlsafe_b64encode(u.encode()).decode().rstrip("=")
+          def send_cfn(event,ctx,status,data=None,reason=None,pid=None):
+            body=json.dumps({"Status":status,"Reason":reason or f"Logs: {ctx.log_stream_name}","PhysicalResourceId":pid or event.get("PhysicalResourceId",ctx.log_stream_name),"StackId":event["StackId"],"RequestId":event["RequestId"],"LogicalResourceId":event["LogicalResourceId"],"Data":data or {}})
+            urllib3.PoolManager().request("PUT",event["ResponseURL"],body=body.encode(),headers={"Content-Type":""})
+          def handler(event,ctx):
+            L.info(json.dumps(event,default=str))
+            rt=event["RequestType"];props=event["ResourceProperties"]
+            if rt=="Delete":
+              send_cfn(event,ctx,"SUCCESS",pid="alb-lookup");return
+            try:
+              cn=props["ClusterName"];ns=props.get("Namespace","envoy-gateway-system")
+              ing_name=props.get("IngressName","cf-vpc-origin")
+              region=props.get("Region",boto3.session.Session().region_name)
+              sess=boto3.Session(region_name=region)
+              eks=sess.client("eks");ci=eks.describe_cluster(name=cn)["cluster"]
+              ep=ci["endpoint"];ca=ci["certificateAuthority"]["data"]
+              tf=tempfile.NamedTemporaryFile(delete=False,suffix=".crt")
+              tf.write(base64.b64decode(ca));tf.flush();tf.close()
+              http=urllib3.PoolManager(cert_reqs="CERT_REQUIRED",ca_certs=tf.name)
+              alb_dns="";alb_arn=""
+              # Poll the Ingress for its assigned ALB hostname (LB Controller creates ALB asynchronously)
+              for attempt in range(360):
+                if ctx.get_remaining_time_in_millis()<120000:break
+                token=get_token(sess,cn,region)
+                hd={"Authorization":f"Bearer {token}","Accept":"application/json"}
+                r=http.request("GET",f"{ep}/apis/networking.k8s.io/v1/namespaces/{ns}/ingresses/{ing_name}",headers=hd)
+                if r.status==200:
+                  ing=json.loads(r.data.decode())
+                  ingress_list=ing.get("status",{}).get("loadBalancer",{}).get("ingress",[])
+                  if ingress_list:
+                    alb_dns=ingress_list[0].get("hostname","")
+                    if alb_dns:
+                      L.info(f"Ingress {ns}/{ing_name} ALB DNS: {alb_dns}");break
+                elif r.status==404:
+                  L.warning(f"Ingress {ns}/{ing_name} not found yet (attempt {attempt+1})")
+                else:
+                  L.warning(f"Ingress query HTTP {r.status} (attempt {attempt+1})")
+                time.sleep(10)
+              if not alb_dns:
+                attempt=event.get("_Attempt",0)
+                if attempt<MAX_REINVOKES:
+                  L.info(f"ALB DNS not found, reinvoking (attempt {attempt+1}/{MAX_REINVOKES})...")
+                  event["_Attempt"]=attempt+1
+                  boto3.client("lambda").invoke(FunctionName=ctx.function_name,InvocationType="Event",Payload=json.dumps(event))
+                  return
+                send_cfn(event,ctx,"FAILED",reason="ALB DNS not available after retries");return
+              # Resolve ALB ARN via DNS name
+              elb=sess.client("elbv2")
+              for lb in elb.describe_load_balancers().get("LoadBalancers",[]):
+                if lb.get("DNSName","")==alb_dns:
+                  alb_arn=lb["LoadBalancerArn"];break
+              if not alb_arn:
+                # ALB might still be provisioning at AWS side; wait briefly
+                for w in range(12):
+                  time.sleep(15)
+                  for lb in elb.describe_load_balancers().get("LoadBalancers",[]):
+                    if lb.get("DNSName","")==alb_dns:
+                      alb_arn=lb["LoadBalancerArn"];break
+                  if alb_arn:break
+              if not alb_arn:
+                send_cfn(event,ctx,"FAILED",reason=f"ALB ARN lookup failed for DNS {alb_dns}");return
+              # Wait for the ALB to be in 'active' state
+              for w in range(60):
+                state=elb.describe_load_balancers(LoadBalancerArns=[alb_arn])["LoadBalancers"][0]["State"]["Code"]
+                if state=="active":L.info(f"ALB active: {alb_arn}");break
+                L.info(f"ALB state {state}, waiting (attempt {w+1})");time.sleep(10)
+              send_cfn(event,ctx,"SUCCESS",data={"AlbDns":alb_dns,"AlbArn":alb_arn},pid=f"alb-lookup-{cn}")
+            except Exception as e:
+              L.exception("fail");send_cfn(event,ctx,"FAILED",reason=str(e)[:256])
+
+  AlbLookup:
+    Type: Custom::AlbLookup
+    DependsOn: K8sInfraResources
+    Properties:
+      ServiceToken: !GetAtt AlbLookupFunction.Arn
+      ClusterName: !Ref EksCluster
+      Namespace: envoy-gateway-system
+      IngressName: cf-vpc-origin
+      Region: !Ref "AWS::Region"
+
+  # SPA Cache Policies
+  CachePolicyStaticAssets:
+    Type: AWS::CloudFront::CachePolicy
+    DependsOn: QuotaCheck
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub "${ProjectName}${EnvironmentId}-static-30d"
+        DefaultTTL: 2592000
+        MaxTTL: 2592000
+        MinTTL: 2592000
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          HeadersConfig:
+            HeaderBehavior: none
+          CookiesConfig:
+            CookieBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  CachePolicyHtml:
+    Type: AWS::CloudFront::CachePolicy
+    DependsOn: QuotaCheck
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub "${ProjectName}${EnvironmentId}-html-1h"
+        DefaultTTL: 3600
+        MaxTTL: 3600
+        MinTTL: 3600
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          HeadersConfig:
+            HeaderBehavior: none
+          CookiesConfig:
+            CookieBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  ResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    DependsOn: QuotaCheck
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub "${ProjectName}${EnvironmentId}-security-headers"
+        Comment: "Security headers + remove server"
+        SecurityHeadersConfig:
+          XSSProtection:
+            Override: true
+            Protection: true
+            ModeBlock: true
+          FrameOptions:
+            Override: true
+            FrameOption: SAMEORIGIN
+          ReferrerPolicy:
+            Override: true
+            ReferrerPolicy: strict-origin-when-cross-origin
+          ContentTypeOptions:
+            Override: true
+          StrictTransportSecurity:
+            Override: true
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Preload: true
+        RemoveHeadersConfig:
+          Items:
+            - Header: Server
+            - Header: X-Powered-By
+
+  # --- CloudFront VPC Origin ---
+  # The gateway LBs are internal (no public IP), so CloudFront cannot reach them
+  # over the public internet. A VPC Origin establishes a CloudFront-managed
+  # PrivateLink connection into the VPC so the distribution can route to the LB
+  # ARN directly. We point it at the dualstack internal ALB (AWS rejects a
+  # dualstack NLB as a VPC origin, so the ALB is used for CloudFront while the
+  # NLB is used for Global Accelerator).
+  # https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-vpc-origins.html
+  CloudFrontVpcOrigin:
+    Type: AWS::CloudFront::VpcOrigin
+    DependsOn: AlbLookup
+    Properties:
+      VpcOriginEndpointConfig:
+        Name: !Sub "${ProjectName}${EnvironmentId}-alb-origin"
+        Arn: !GetAtt AlbLookup.AlbArn
+        HTTPPort: 80
+        HTTPSPort: 443
+        OriginProtocolPolicy: http-only
+        OriginSSLProtocols:
+          - TLSv1.2
+
+  # --- CloudFront managed SG ingress to AlbSecurityGroup ---
+  # When AWS creates the first VPC Origin in an account it auto-creates a
+  # service-managed security group (CloudFront-VPCOrigins-Service-SG) in the VPC.
+  # VPC CIDR ingress alone is NOT sufficient for CloudFront's traffic (AWS
+  # internal routing bypasses IP-based SG checks); the only reliable way is an
+  # SG-to-SG ingress rule. This Lambda finds that SG by tag and authorizes it.
+  CloudFrontSgIngressFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: QuotaCheck
+    Properties:
+      FunctionName: !Sub "${ProjectName}${EnvironmentId}-cf-sg-ingress"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 600
+      MemorySize: 256
+      Role: !GetAtt KubectlLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json,logging,time,boto3,urllib3
+          L=logging.getLogger();L.setLevel(logging.INFO)
+          def send_cfn(event,ctx,status,reason=None,pid=None,data=None):
+            body=json.dumps({"Status":status,"Reason":reason or f"Logs: {ctx.log_stream_name}","PhysicalResourceId":pid or event.get("PhysicalResourceId",ctx.log_stream_name),"StackId":event["StackId"],"RequestId":event["RequestId"],"LogicalResourceId":event["LogicalResourceId"],"Data":data or {}})
+            urllib3.PoolManager().request("PUT",event["ResponseURL"],body=body.encode(),headers={"Content-Type":""})
+          def handler(event,ctx):
+            L.info(json.dumps(event,default=str))
+            rt=event["RequestType"];props=event["ResourceProperties"]
+            region=props.get("Region",boto3.session.Session().region_name)
+            ec2=boto3.client("ec2",region_name=region)
+            alb_sg=props["AlbSecurityGroupId"];vpc_id=props["VpcId"]
+            port=int(props.get("Port","80"))
+            try:
+              cf_sg=None
+              # Wait up to 10 min for CloudFront to auto-create the SG
+              for att in range(60):
+                if ctx.get_remaining_time_in_millis()<60000:break
+                resp=ec2.describe_security_groups(Filters=[
+                  {"Name":"vpc-id","Values":[vpc_id]},
+                  {"Name":"tag:aws.cloudfront.vpcorigin","Values":["enabled"]}])
+                if resp["SecurityGroups"]:
+                  cf_sg=resp["SecurityGroups"][0]["GroupId"]
+                  L.info(f"Found CloudFront managed SG: {cf_sg} (attempt {att+1})")
+                  break
+                L.info(f"Waiting for CloudFront-VPCOrigins-Service-SG (attempt {att+1})")
+                time.sleep(10)
+              if rt=="Delete":
+                if cf_sg:
+                  try:
+                    ec2.revoke_security_group_ingress(GroupId=alb_sg,IpPermissions=[{"IpProtocol":"tcp","FromPort":port,"ToPort":port,"UserIdGroupPairs":[{"GroupId":cf_sg}]}])
+                    L.info(f"Revoked ingress from {cf_sg}")
+                  except Exception as e:
+                    L.warning(f"Revoke (non-fatal): {e}")
+                send_cfn(event,ctx,"SUCCESS",pid=event.get("PhysicalResourceId","cf-sg-ingress"))
+                return
+              if not cf_sg:
+                send_cfn(event,ctx,"FAILED",reason="CloudFront managed SG not found within timeout")
+                return
+              try:
+                ec2.authorize_security_group_ingress(GroupId=alb_sg,IpPermissions=[{"IpProtocol":"tcp","FromPort":port,"ToPort":port,"UserIdGroupPairs":[{"GroupId":cf_sg,"Description":"CloudFront VPC Origin managed SG"}]}])
+                L.info(f"Ingress added to {alb_sg} from {cf_sg}")
+              except Exception as e:
+                if "InvalidPermission.Duplicate" in str(e):
+                  L.info("Rule already exists - OK")
+                else:
+                  raise
+              send_cfn(event,ctx,"SUCCESS",data={"CloudFrontSgId":cf_sg},pid=f"cf-sg-ingress-{alb_sg}")
+            except Exception as e:
+              L.exception("fail");send_cfn(event,ctx,"FAILED",reason=str(e)[:256])
+
+  CloudFrontSgIngress:
+    Type: Custom::CloudFrontSgIngress
+    DependsOn: CloudFrontVpcOrigin
+    Properties:
+      ServiceToken: !GetAtt CloudFrontSgIngressFunction.Arn
+      AlbSecurityGroupId: !Ref AlbSecurityGroup
+      VpcId: !Ref VPC
+      Port: 80
+      Region: !Ref "AWS::Region"
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: CloudFrontSgIngress
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${ProjectName}${EnvironmentId} - HTTP via EnvoyGateway"
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_200
+        Origins:
+          - Id: EnvoyGatewayNLB
+            DomainName: !GetAtt AlbLookup.AlbDns
+            VpcOriginConfig:
+              VpcOriginId: !GetAtt CloudFrontVpcOrigin.Id
+              OriginKeepaliveTimeout: 60
+              OriginReadTimeout: 60
+            OriginCustomHeaders:
+              - HeaderName: X-CloudFront-Secret
+                HeaderValue: !Sub "cnf-${EnvironmentId}-${AWS::AccountId}"
+        DefaultCacheBehavior:
+          TargetOriginId: EnvoyGatewayNLB
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+          OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
+          ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+          Compress: true
+        CacheBehaviors:
+          - PathPattern: "/assets/*"
+            TargetOriginId: EnvoyGatewayNLB
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: !Ref CachePolicyStaticAssets
+            OriginRequestPolicyId: "bf0718e1-ba1e-49d1-88b1-f726733018ae"
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            Compress: true
+          - PathPattern: "/ui"
+            TargetOriginId: EnvoyGatewayNLB
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: !Ref CachePolicyHtml
+            OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            Compress: true
+          - PathPattern: "/ui/*"
+            TargetOriginId: EnvoyGatewayNLB
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: !Ref CachePolicyHtml
+            OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            Compress: true
+          - PathPattern: "/auth/*"
+            TargetOriginId: EnvoyGatewayNLB
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+            OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            Compress: true
+          - PathPattern: "/sso/*"
+            TargetOriginId: EnvoyGatewayNLB
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+            OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            Compress: true
+          - PathPattern: "/auth/oidc/*"
+            TargetOriginId: EnvoyGatewayNLB
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+            OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            Compress: true
+        CustomErrorResponses:
+          - ErrorCode: 502
+            ErrorCachingMinTTL: 1
+          - ErrorCode: 503
+            ErrorCachingMinTTL: 1
+          - ErrorCode: 504
+            ErrorCachingMinTTL: 1
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-cf"
+
+  # ============================================================================
+  # SECTION 9: GLOBAL ACCELERATOR
+  # ============================================================================
+
+  GlobalAccelerator:
+    Type: AWS::GlobalAccelerator::Accelerator
+    DependsOn: QuotaCheck
+    Properties:
+      Name: !Sub "${ProjectName}${EnvironmentId}"
+      IpAddressType: DUAL_STACK
+      Enabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-ga"
+
+  GAListener443:
+    Type: AWS::GlobalAccelerator::Listener
+    Properties:
+      AcceleratorArn: !Ref GlobalAccelerator
+      Protocol: TCP
+      PortRanges:
+        - FromPort: 443
+          ToPort: 443
+
+  GAEndpointGroup443:
+    Type: AWS::GlobalAccelerator::EndpointGroup
+    Properties:
+      ListenerArn: !Ref GAListener443
+      EndpointGroupRegion: !Ref "AWS::Region"
+      EndpointConfigurations:
+        - EndpointId: !GetAtt NlbLookup.NlbArn
+          ClientIPPreservationEnabled: true
+          Weight: 100
+
+  GAListener80:
+    Type: AWS::GlobalAccelerator::Listener
+    Properties:
+      AcceleratorArn: !Ref GlobalAccelerator
+      Protocol: TCP
+      PortRanges:
+        - FromPort: 80
+          ToPort: 80
+
+  GAEndpointGroup80:
+    Type: AWS::GlobalAccelerator::EndpointGroup
+    Properties:
+      ListenerArn: !Ref GAListener80
+      EndpointGroupRegion: !Ref "AWS::Region"
+      EndpointConfigurations:
+        - EndpointId: !GetAtt NlbLookup.NlbArn
+          ClientIPPreservationEnabled: true
+          Weight: 100
+
+  # ============================================================================
+  # SECTION 10: KUBERNETES APP RESOURCES (Test Pod + Routes + OIDC Policy)
+  # ============================================================================
+
+  EfsCsiPodIdentityAssoc:
+    Type: AWS::EKS::PodIdentityAssociation
+    DependsOn: AddonEfsCsi
+    Properties:
+      ClusterName: !Ref EksCluster
+      Namespace: kube-system
+      ServiceAccount: efs-csi-controller-sa
+      RoleArn: !GetAtt EfsCsiRole.Arn
+
+  LiteLLMPodIdentityAssoc:
+    Type: AWS::EKS::PodIdentityAssociation
+    DependsOn: AddonEfsCsi
+    Properties:
+      ClusterName: !Ref EksCluster
+      Namespace: litellm
+      ServiceAccount: litellm-sa
+      RoleArn: !GetAtt PodRole.Arn
+
+  # Placeholder - maintains dependency chain for GAHttpsSetup
+  K8sAppResources:
+    Type: Custom::K8sApp
+    DependsOn:
+      - K8sInfraResources
+      - NlbLookup
+      - AuroraInstance
+    Properties:
+      ServiceToken: !GetAtt KubectlFunction.Arn
+      ClusterName: !Ref EksCluster
+      Region: !Ref "AWS::Region"
+      Manifests:
+        # --- LiteLLM Namespace ---
+        - apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: litellm
+        # --- LiteLLM ServiceAccount (IRSA via Pod Identity) ---
+        - apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: litellm-sa
+            namespace: litellm
+        # --- LiteLLM PostgreSQL credentials Secret ---
+        - apiVersion: v1
+          kind: Secret
+          metadata:
+            name: postgres-creds
+            namespace: litellm
+          type: Opaque
+          stringData:
+            username: pgadmin
+            password: !Sub "${ProjectName}${EnvironmentId}Pg2026!"
+        # --- LiteLLM master-key Secret (strong, unguessable, per-stack) ---
+        # A master key is REQUIRED: LiteLLM signs the SSO UI-session JWT with it
+        # (HS256), and an empty key makes SSO login impossible (PyJWT rejects an
+        # empty HMAC key). The original security risk was a *hardcoded, public*
+        # key (sk-litellm-proxy-master-key) — anyone could use it. We instead
+        # derive a strong random key from the CloudFormation StackId GUID (unique
+        # per deployment, not in source), and — critically — restrict what the
+        # master key may DO via the custom_auth hook below: it becomes read-only
+        # (usage/stats), and CANNOT call models or create/modify keys. Those
+        # operations require an SSO-issued admin virtual key. We point the chart
+        # at this Secret via masterkeySecretName (see LiteLLMDeploy HelmSets),
+        # which also suppresses the chart's own random-key Secret.
+        - apiVersion: v1
+          kind: Secret
+          metadata:
+            name: litellm-masterkey
+            namespace: litellm
+          type: Opaque
+          stringData:
+            # StackId is like arn:aws:cloudformation:...:stack/<name>/<guid>;
+            # the trailing GUID is unique per stack and not in the template.
+            masterkey: !Sub
+              - "sk-cnf-${Guid}"
+              - Guid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+        # --- LiteLLM custom_auth module (master key = read-only) ---
+        # Mounted into the proxy at /etc/litellm/ (LiteLLM resolves custom_auth
+        # module paths relative to the config file dir). In auto mode the
+        # enterprise custom-auth wrapper falls back to LiteLLM's built-in auth
+        # whenever this hook raises a non-ProxyException, so we only OWN the
+        # master-key deny decision and defer everything else unchanged.
+        - apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: litellm-custom-auth
+            namespace: litellm
+          data:
+            litellm_master_key_readonly.py: |
+              """custom_auth: make the LiteLLM master key read-only.
+
+              The master key must exist (it signs the SSO UI-session JWT) but must
+              NOT be usable to call models or create/modify/delete API keys. It
+              keeps read & statistics access. Any other credential (SSO admin
+              virtual key, normal virtual key, JWT) defers to built-in auth.
+              """
+              import os
+              from fastapi import Request
+              from litellm.proxy._types import LiteLLMRoutes, ProxyException
+              from litellm.proxy.auth.auth_utils import get_request_route
+
+
+              class _Fallback(Exception):
+                  """Hand control back to LiteLLM's built-in auth (auto mode)."""
+
+
+              _MASTER_KEY_ALLOWED = set(LiteLLMRoutes.info_routes.value) | {
+                  "/spend/logs", "/spend/logs/v2", "/spend/calculate", "/spend/tags",
+                  "/global/spend", "/global/spend/logs", "/global/spend/report",
+                  "/global/spend/tags", "/global/spend/keys", "/global/spend/models",
+                  "/global/spend/provider", "/global/spend/end_users",
+                  "/global/activity", "/global/activity/model",
+                  "/global/activity/exceptions",
+                  "/key/info", "/key/health", "/key/list",
+                  "/user/info", "/v2/user/info", "/user/list",
+                  "/team/info", "/team/list", "/team/available",
+                  "/model/info", "/v1/model/info", "/models", "/v1/models",
+                  "/model_group/info", "/active/callbacks", "/settings",
+                  "/health", "/health/liveliness", "/health/liveness",
+                  "/health/readiness", "/health/services",
+              }
+
+
+              async def user_api_key_auth(request: Request, api_key: str):
+                  master_key = os.environ.get("PROXY_MASTER_KEY", "") or ""
+                  presented = (api_key or "").replace("Bearer ", "").strip()
+                  if master_key and presented == master_key:
+                      route = get_request_route(request=request)
+                      if route not in _MASTER_KEY_ALLOWED:
+                          raise ProxyException(
+                              message=(
+                                  "master key is read-only: it can only read "
+                                  "usage/statistics. It cannot call models or "
+                                  "create/modify keys. Use an SSO-issued admin "
+                                  "virtual key for those operations."
+                              ),
+                              type="auth_error",
+                              param="api_key",
+                              code=403,
+                          )
+                  raise _Fallback()
+        # --- LiteLLM HTTPRoute (CloudFront) ---
+        - apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata:
+            name: litellm-cf
+            namespace: litellm
+          spec:
+            parentRefs:
+              - name: eg
+                namespace: envoy-gateway-system
+            hostnames:
+              - !GetAtt CloudFrontDistribution.DomainName
+            rules:
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /
+                backendRefs:
+                  - name: litellm
+                    port: 4000
+        # --- LiteLLM HTTPRoute (GA) ---
+        - apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata:
+            name: litellm-ga
+            namespace: litellm
+          spec:
+            parentRefs:
+              - name: eg
+                namespace: envoy-gateway-system
+            hostnames:
+              - !GetAtt GlobalAccelerator.DualStackDnsName
+            rules:
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /
+                backendRefs:
+                  - name: litellm
+                    port: 4000
+        # --- LiteLLM UI SPA rewrite: /ui/chat -> /ui/chat.html ---
+        - apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata:
+            name: litellm-ui-rewrite
+            namespace: litellm
+          spec:
+            parentRefs:
+              - name: eg
+                namespace: envoy-gateway-system
+            hostnames:
+              - !GetAtt CloudFrontDistribution.DomainName
+            rules:
+              - matches:
+                  - path:
+                      type: Exact
+                      value: /ui/chat
+                filters:
+                  - type: URLRewrite
+                    urlRewrite:
+                      path:
+                        type: ReplaceFullPath
+                        replaceFullPath: /ui/chat.html
+                backendRefs:
+                  - name: litellm
+                    port: 4000
+        # --- LiteLLM HPA ---
+        - apiVersion: autoscaling/v2
+          kind: HorizontalPodAutoscaler
+          metadata:
+            name: litellm-hpa
+            namespace: litellm
+          spec:
+            scaleTargetRef:
+              apiVersion: apps/v1
+              kind: Deployment
+              name: litellm
+            # Production: 2 replicas minimum for HA (survive a node/AZ loss and
+            # rolling restarts without dropping to zero capacity).
+            minReplicas: 2
+            # Cap scale-out to a sane bound. At ~5Gi request/pod, 20 pods is
+            # ~100Gi + 20 vCPU of requests — enough for large bursts while
+            # preventing a runaway fan-out (and runaway Karpenter/cost).
+            maxReplicas: 20
+            metrics:
+              # Scale on CPU utilization ONLY. LiteLLM is an I/O-bound gateway:
+              # its memory is a fixed per-worker baseline (~3.7Gi at idle for
+              # num_workers=4), NOT a function of load — so a memory metric is a
+              # broken scaling signal (it reads "hot" even while idle and never
+              # converges). CPU tracks real request pressure.
+              - type: Resource
+                resource:
+                  name: cpu
+                  target:
+                    type: Utilization
+                    averageUtilization: 70
+            behavior:
+              scaleUp:
+                # React fast to load spikes, but not on transient blips.
+                stabilizationWindowSeconds: 60
+                policies:
+                # Allow either +100% or +4 pods per minute, whichever is greater.
+                - type: Percent
+                  value: 100
+                  periodSeconds: 60
+                - type: Pods
+                  value: 4
+                  periodSeconds: 60
+                selectPolicy: Max
+              scaleDown:
+                # Scale in conservatively (5min window) so long-lived streaming
+                # requests aren't disrupted by premature pod removal.
+                stabilizationWindowSeconds: 300
+                policies:
+                - type: Pods
+                  value: 1
+                  periodSeconds: 120
+        # --- LiteLLM BackendTrafficPolicy: 5min timeout + streaming ---
+        - apiVersion: gateway.envoyproxy.io/v1alpha1
+          kind: BackendTrafficPolicy
+          metadata:
+            name: litellm-timeout
+            namespace: litellm
+          spec:
+            targetRefs:
+              - group: gateway.networking.k8s.io
+                kind: HTTPRoute
+                name: litellm-cf
+              - group: gateway.networking.k8s.io
+                kind: HTTPRoute
+                name: litellm-ga
+            timeout:
+              http:
+                connectionIdleTimeout: 620s
+                requestTimeout: 600s
+            circuitBreaker:
+              maxParallelRequests: 2048
+              maxConnections: 200
+              maxPendingRequests: 512
+        # --- EnvoyGateway ClientTrafficPolicy: HTTP/2 tuning + connection limits ---
+        - apiVersion: gateway.envoyproxy.io/v1alpha1
+          kind: ClientTrafficPolicy
+          metadata:
+            name: enable-h2
+            namespace: envoy-gateway-system
+          spec:
+            targetRefs:
+              - group: gateway.networking.k8s.io
+                kind: Gateway
+                name: eg
+            connection:
+              connectionLimit:
+                value: 10000
+              maxAcceptPerSocketEvent: 1
+            http1:
+              preserveHeaderCase: true
+            http2:
+              initialConnectionWindowSize: 268435456
+              initialStreamWindowSize: 268435456
+              maxConcurrentStreams: 1000
+            timeout:
+              http:
+                requestReceivedTimeout: "0s"
+
+  # Helm-based app deployment
+  HelmDeployFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: QuotaCheck
+    Properties:
+      FunctionName: !Sub "${ProjectName}${EnvironmentId}-helm-deploy"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 600
+      MemorySize: 512
+      Role: !GetAtt KubectlLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import base64,json,logging,os,stat,subprocess,tempfile,time,urllib3,boto3
+          from botocore.signers import RequestSigner
+          L=logging.getLogger();L.setLevel(logging.INFO)
+          HELM_URL="https://get.helm.sh/helm-v3.17.3-linux-amd64.tar.gz"
+          def get_token(sess,cluster,region):
+            sts=sess.client("sts",region_name=region);si=sts.meta.service_model.service_id
+            sg=RequestSigner(si,region,"sts","v4",sess.get_credentials(),sess.events)
+            p={"method":"GET","url":f"https://sts.{region}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15","body":{},"headers":{"x-k8s-aws-id":cluster},"context":{}}
+            u=sg.generate_presigned_url(p,region_name=region,expires_in=60,operation_name="")
+            return "k8s-aws-v1."+base64.urlsafe_b64encode(u.encode()).decode().rstrip("=")
+          def send_cfn(event,ctx,status,data=None,reason=None,pid=None):
+            body=json.dumps({"Status":status,"Reason":reason or f"Logs: {ctx.log_stream_name}","PhysicalResourceId":pid or event.get("PhysicalResourceId",ctx.log_stream_name),"StackId":event["StackId"],"RequestId":event["RequestId"],"LogicalResourceId":event["LogicalResourceId"],"Data":data or{}})
+            urllib3.PoolManager().request("PUT",event["ResponseURL"],body=body.encode(),headers={"Content-Type":""})
+          def install_helm():
+            helm="/tmp/helm"
+            if os.path.exists(helm):return helm
+            http=urllib3.PoolManager()
+            r=http.request("GET",HELM_URL)
+            tgz="/tmp/helm.tar.gz"
+            with open(tgz,"wb") as f:f.write(r.data)
+            import tarfile
+            with tarfile.open(tgz,"r:gz") as t:
+              m=t.getmember("linux-amd64/helm")
+              m.name="helm"
+              t.extract(m,"/tmp")
+            os.chmod(helm,stat.S_IRWXU)
+            return helm
+          def handler(event,ctx):
+            L.info(json.dumps(event,default=str))
+            rt=event["RequestType"];props=event["ResourceProperties"]
+            if rt=="Delete":
+              try:
+                helm=install_helm()
+                cn=props["ClusterName"];ns=props["Namespace"]
+                region=props.get("Region",boto3.session.Session().region_name)
+                sess=boto3.Session(region_name=region)
+                eks=sess.client("eks");ci=eks.describe_cluster(name=cn)["cluster"]
+                ep=ci["endpoint"];ca_data=ci["certificateAuthority"]["data"]
+                ca_file=tempfile.NamedTemporaryFile(delete=False,suffix=".crt")
+                ca_file.write(base64.b64decode(ca_data));ca_file.flush();ca_file.close()
+                token=get_token(sess,cn,region)
+                kc={"apiVersion":"v1","kind":"Config","clusters":[{"cluster":{"server":ep,"certificate-authority":ca_file.name},"name":"c"}],"contexts":[{"context":{"cluster":"c","user":"u"},"name":"x"}],"current-context":"x","users":[{"name":"u","user":{"token":token}}]}
+                kf=tempfile.NamedTemporaryFile(delete=False,suffix=".yaml",mode="w")
+                json.dump(kc,kf);kf.flush();kf.close()
+                env={**os.environ,"KUBECONFIG":kf.name}
+                r=subprocess.run([helm,"uninstall",props.get("ReleaseName","cnf"),"-n",ns,"--ignore-not-found"],capture_output=True,text=True,env=env)
+                L.info(f"Uninstall: {r.stdout} {r.stderr}")
+              except Exception as e:
+                L.warning(f"Delete cleanup: {e}")
+              send_cfn(event,ctx,"SUCCESS",pid="helm-deploy");return
+            try:
+              cn=props["ClusterName"];ns=props["Namespace"]
+              region=props.get("Region",boto3.session.Session().region_name)
+              sess=boto3.Session(region_name=region)
+              # Get client secret
+              pool_id=props.get("UserPoolId","");client_id=props.get("ClientId","")
+              secret=""
+              if pool_id and client_id:
+                cog=sess.client("cognito-idp")
+                resp=cog.describe_user_pool_client(UserPoolId=pool_id,ClientId=client_id)
+                secret=resp["UserPoolClient"].get("ClientSecret","")
+              # Setup kubeconfig
+              helm=install_helm()
+              eks=sess.client("eks");ci=eks.describe_cluster(name=cn)["cluster"]
+              ep=ci["endpoint"];ca_data=ci["certificateAuthority"]["data"]
+              ca_file=tempfile.NamedTemporaryFile(delete=False,suffix=".crt")
+              ca_file.write(base64.b64decode(ca_data));ca_file.flush();ca_file.close()
+              token=get_token(sess,cn,region)
+              kc={"apiVersion":"v1","kind":"Config","clusters":[{"cluster":{"server":ep,"certificate-authority":ca_file.name},"name":"c"}],"contexts":[{"context":{"cluster":"c","user":"u"},"name":"x"}],"current-context":"x","users":[{"name":"u","user":{"token":token}}]}
+              kf=tempfile.NamedTemporaryFile(delete=False,suffix=".yaml",mode="w")
+              json.dump(kc,kf);kf.flush();kf.close()
+              env={**os.environ,"KUBECONFIG":kf.name,"HELM_CACHE_HOME":"/tmp/helm-cache","HELM_CONFIG_HOME":"/tmp/helm-config","HELM_DATA_HOME":"/tmp/helm-data"}
+              # Build helm command
+              release=props.get("ReleaseName","cnf")
+              chart=props.get("ChartRef","oci://public.ecr.aws/b1y9i2f3/cnf")
+              version=props.get("ChartVersion","0.1.0")
+              wait_install=not props.get("LiteLLMConfig")
+              cmd=[helm,"upgrade","--install",release,chart,"--version",version,"--namespace",ns,"--create-namespace"]
+              if wait_install:cmd+=["--wait","--timeout","10m"]
+              sets=props.get("HelmSets",{})
+              for k,v in sets.items():
+                cmd+=["--set",f"{k}={v}"]
+              # GA all IPs as Helm array
+              ga_ips_key=props.get("GAIpsKey")
+              if ga_ips_key:
+                ips=[f"{ip}/32" for ip in props.get("GAIpv4s",[])]+[f"{ip}/128" for ip in props.get("GAIpv6s",[])]
+                cmd+=["--set",f"{ga_ips_key}={{{','.join(ips)}}}"]
+              # Add auth URI if cognito configured
+              if pool_id and client_id and secret:
+                issuer_host=f"cognito-idp.{region}.amazonaws.com/{pool_id}"
+                auth_uri=f"oidc://{client_id}:{secret}@{issuer_host}?scope=openid%20profile%20email&oidc_logout=false"
+                cmd+=["--set",f"scaffolding.config.auth={auth_uri}"]
+              # LiteLLM-specific config
+              if props.get("LiteLLMConfig"):
+                domain=f"cnf-{props.get('EnvironmentId','001')}-{boto3.client('sts').get_caller_identity()['Account']}"
+                cognito_base=f"https://{domain}.auth.{region}.amazoncognito.com"
+                litellm_env=props.get("LiteLLMEnv",{})
+                # DB endpoint from Aurora
+                db_ep=props.get("AuroraEndpoint","")
+                if db_ep:
+                  cmd+=["--set",f"db.endpoint={db_ep}"]
+                  cmd+=["--set","db.database=litellm"]
+                  cmd+=["--set","db.url=postgresql://$(DATABASE_USERNAME):$(DATABASE_PASSWORD)@$(DATABASE_HOST):5432/$(DATABASE_NAME)"]
+                # Cognito SSO env vars
+                cmd+=["--set",f"envVars.GENERIC_CLIENT_ID={client_id}"]
+                cmd+=["--set",f"envVars.GENERIC_CLIENT_SECRET={secret}"]
+                cmd+=["--set",f"envVars.GENERIC_AUTHORIZATION_ENDPOINT={cognito_base}/oauth2/authorize"]
+                cmd+=["--set",f"envVars.GENERIC_TOKEN_ENDPOINT={cognito_base}/oauth2/token"]
+                cmd+=["--set",f"envVars.GENERIC_USERINFO_ENDPOINT={cognito_base}/oauth2/userInfo"]
+                # Logout URL (use CloudFront host for UI redirect)
+                cf_host=litellm_env.get("CLOUDFRONT_HOST","")
+                ui_url=f"https://{cf_host}/ui/" if cf_host else ""
+                cmd+=["--set",f"envVars.PROXY_LOGOUT_URL={cognito_base}/logout?client_id={client_id}&logout_uri={ui_url}"]
+                # All other LiteLLM env vars
+                for ek,ev in litellm_env.items():
+                  if ek=="CLOUDFRONT_HOST":continue
+                  flag="--set-string" if "{" in str(ev) else "--set"
+                  # Helm --set-string interprets {} as array; use --set-json for dict values
+                  if "{" in str(ev) and ":" in str(ev):
+                    cmd+=["--set-json",f'envVars.{ek}={json.dumps(ev)}']
+                  else:
+                    cmd+=[flag,f"envVars.{ek}={ev}"]
+                # Args for IPv6 binding + num_workers for parallel processing
+                cmd+=["--set-string","args[0]=--config","--set-string","args[1]=/etc/litellm/config.yaml","--set-string","args[2]=--host","--set-string","args[3]=::","--set-string","args[4]=--num_workers","--set-string","args[5]=4"]
+                # Proxy config (model list): (model_name, litellm model path, extra litellm_params)
+                # Claude models route via the Bedrock Converse API using global
+                # cross-region inference profiles. GPT-5.4/5.5 are only served via
+                # the OpenAI-compatible bedrock-mantle endpoint (no Converse
+                # support) and are In-Region only, so aws_region_name must be
+                # pinned to us-east-2 per the AWS model cards:
+                # https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-55.html
+                models=[
+                  ("claude-sonnet-4-6","bedrock/global.anthropic.claude-sonnet-4-6",{}),
+                  ("claude-opus-4-6","bedrock/global.anthropic.claude-opus-4-6-v1",{}),
+                  ("claude-sonnet-4-5-20250929","bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0",{}),
+                  ("claude-opus-4-5-20251101","bedrock/global.anthropic.claude-opus-4-5-20251101-v1:0",{}),
+                  ("claude-haiku-4-5-20251001","bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0",{}),
+                  ("claude-opus-4-8","bedrock/global.anthropic.claude-opus-4-8",{}),
+                  ("claude-sonnet-5","bedrock/global.anthropic.claude-sonnet-5",{}),
+                  ("claude-fable-5","bedrock/global.anthropic.claude-fable-5",{}),
+                  ("gpt-5.4","bedrock_mantle/openai.gpt-5.4",{"aws_region_name":"us-east-2"}),
+                  ("gpt-5.5","bedrock_mantle/openai.gpt-5.5",{"aws_region_name":"us-east-2"}),
+                ]
+                for i,(mn,mp,mx) in enumerate(models):
+                  cmd+=["--set",f"proxy_config.model_list[{i}].model_name={mn}","--set",f"proxy_config.model_list[{i}].litellm_params.model={mp}"]
+                  for xk,xv in mx.items():
+                    cmd+=["--set",f"proxy_config.model_list[{i}].litellm_params.{xk}={xv}"]
+                # Wildcard: allow all bedrock models via pass-through
+                idx=len(models)
+                cmd+=["--set",f"proxy_config.model_list[{idx}].model_name=bedrock/*","--set",f"proxy_config.model_list[{idx}].litellm_params.model=bedrock/*","--set",f"proxy_config.model_list[{idx}].litellm_params.aws_region_name={props.get('BedrockWildcardRegion','us-west-2')}"]
+                cmd+=["--set","proxy_config.general_settings.master_key=os.environ/PROXY_MASTER_KEY"]
+                # Restrict the master key to READ-ONLY (usage/stats): it cannot
+                # call models or create/modify keys. The module is mounted at
+                # /etc/litellm/ (see volumes/volumeMounts below); LiteLLM resolves
+                # custom_auth relative to the config dir. mode=auto => the hook
+                # only owns the master-key deny path; all other creds defer to
+                # built-in auth. Admins operate via SSO-issued virtual keys.
+                cmd+=["--set","proxy_config.general_settings.custom_auth=litellm_master_key_readonly.user_api_key_auth"]
+                cmd+=["--set","proxy_config.general_settings.custom_auth_settings.mode=auto"]
+                # Mount the custom_auth ConfigMap (created in K8sAppResources).
+                cmd+=["--set-json",'volumes=[{"name":"custom-auth","configMap":{"name":"litellm-custom-auth"}}]']
+                cmd+=["--set-json",'volumeMounts=[{"name":"custom-auth","mountPath":"/etc/litellm/litellm_master_key_readonly.py","subPath":"litellm_master_key_readonly.py"}]']
+                cmd+=["--set","proxy_config.general_settings.forward_client_headers_to_llm_api=false"]
+                cmd+=["--set","proxy_config.general_settings.store_prompts_in_spend_logs=true"]
+                cmd+=["--set","proxy_config.general_settings.maximum_spend_logs_retention_period=7d"]
+                cmd+=["--set","proxy_config.general_settings.proxy_batch_write_at=30"]
+                cmd+=["--set","proxy_config.general_settings.disable_error_logs=true"]
+                cmd+=["--set","proxy_config.general_settings.allow_requests_on_db_unavailable=true"]
+                cmd+=["--set","proxy_config.general_settings.database_connection_pool_limit=24"]
+                cmd+=["--set","proxy_config.general_settings.max_parallel_requests=100"]
+                cmd+=["--set","proxy_config.general_settings.global_max_parallel_requests=500"]
+                cmd+=["--set","proxy_config.litellm_settings.drop_params=true"]
+                cmd+=["--set","proxy_config.litellm_settings.set_verbose=false"]
+                cmd+=["--set","proxy_config.litellm_settings.json_logs=true"]
+                cmd+=["--set","proxy_config.litellm_settings.request_timeout=600"]
+                cmd+=["--set","proxy_config.litellm_settings.cache=true"]
+                # Security: require every virtual key to carry a budget so a
+                # leaked key is self-limiting (capped spend, no open-ended risk).
+                # Enforced for team/non-admin key creation; proxy_admin callers
+                # bypass required_params (see docs/helm.md §9). Budgets are still
+                # enforced at spend time regardless of issuer.
+                cmd+=["--set-json",'proxy_config.litellm_settings.key_generation_settings={"team_key_generation":{"required_params":["max_budget","budget_duration"]},"personal_key_generation":{"required_params":["max_budget","budget_duration"]}}']
+                # Valkey/Redis cache via ElastiCache Serverless
+                valkey_host=props.get("ValkeyHost","")
+                valkey_port=props.get("ValkeyPort","6379")
+                valkey_pw=props.get("ValkeyPassword","")
+                if valkey_host:
+                  cmd+=["--set",f"proxy_config.litellm_settings.cache_params.type=redis"]
+                  cmd+=["--set",f"proxy_config.litellm_settings.cache_params.host={valkey_host}"]
+                  cmd+=["--set",f"proxy_config.litellm_settings.cache_params.port={valkey_port}"]
+                  cmd+=["--set",f"proxy_config.litellm_settings.cache_params.password={valkey_pw}"]
+                  cmd+=["--set","proxy_config.litellm_settings.cache_params.ssl=true"]
+                  cmd+=["--set","proxy_config.litellm_settings.cache_params.ttl=600"]
+                  cmd+=["--set",f"proxy_config.router_settings.redis_host={valkey_host}"]
+                  cmd+=["--set",f"proxy_config.router_settings.redis_port={valkey_port}"]
+                  cmd+=["--set",f"proxy_config.router_settings.redis_password={valkey_pw}"]
+                  cmd+=["--set","proxy_config.router_settings.routing_strategy=simple-shuffle"]
+                  cmd+=["--set-string",f"envVars.REDIS_HOST={valkey_host}"]
+                  cmd+=["--set-string",f"envVars.REDIS_PORT={valkey_port}"]
+                  cmd+=["--set-string",f"envVars.REDIS_PASSWORD={valkey_pw}"]
+                  cmd+=["--set-string","envVars.REDIS_SSL=True"]
+                # Static LiteLLM helm values (split by type)
+                # NOTE: NO "masterkey" is set here. Instead we point the chart at the
+                # pre-created, INTENTIONALLY EMPTY "litellm-masterkey" Secret (see
+                # K8sAppResources) via masterkeySecretName/masterkeySecretKey. This
+                # both (a) suppresses the chart's default behaviour of auto-generating
+                # a random "sk-..." master key Secret, and (b) leaves the injected
+                # PROXY_MASTER_KEY env var empty, so LiteLLM has NO functional master
+                # key — all admin/inference endpoints return 401 and auth is handled
+                # exclusively via Cognito SSO. Verified empirically on EKS.
+                for sk,sv in {"masterkeySecretName":"litellm-masterkey","masterkeySecretKey":"masterkey","service.type":"ClusterIP","service.port":"4000","serviceAccount.create":"false","serviceAccount.name":"litellm-sa","db.useExisting":"true","db.deployStandalone":"false","db.secret.name":"postgres-creds","db.secret.usernameKey":"username","db.secret.passwordKey":"password","migrationJob.enabled":"true","redis.enabled":"false","ingress.enabled":"false","nodeSelector.kubernetes\\.io/arch":"arm64","startupProbe.path":"/health/readiness","startupProbe.initialDelaySeconds":"30","startupProbe.periodSeconds":"10","startupProbe.failureThreshold":"60","livenessProbe.path":"/health/liveliness","readinessProbe.path":"/health/readiness","strategy.type":"RollingUpdate"}.items():
+                  cmd+=["--set",f"{sk}={sv}"]
+                # Production sizing. Memory request 5Gi matches the ~3.7Gi idle
+                # baseline of num_workers=4 plus headroom, so the scheduler packs
+                # pods honestly (no node oversubscription -> no cascading OOM).
+                # Limit 8Gi absorbs concurrency / long-context spikes without
+                # OOMKill. CPU request 1 gives the HPA a meaningful 70% base
+                # (=700m); limit 4 lets a busy pod use spare cores.
+                for sk,sv in {"resources.requests.cpu":"1000m","resources.requests.memory":"5Gi","resources.limits.cpu":"4000m","resources.limits.memory":"8Gi"}.items():
+                  cmd+=["--set-string",f"{sk}={sv}"]
+                for sk,sv in {"strategy.rollingUpdate.maxUnavailable":"0","strategy.rollingUpdate.maxSurge":"1"}.items():
+                  cmd+=["--set",f"{sk}={sv}"]
+                # TopologySpreadConstraints for multi-AZ distribution
+                cmd+=["--set-json","topologySpreadConstraints=[{\"maxSkew\":1,\"topologyKey\":\"topology.kubernetes.io/zone\",\"whenUnsatisfiable\":\"DoNotSchedule\",\"labelSelector\":{\"matchLabels\":{\"app.kubernetes.io/name\":\"litellm\"}}},{\"maxSkew\":2,\"topologyKey\":\"kubernetes.io/hostname\",\"whenUnsatisfiable\":\"ScheduleAnyway\",\"labelSelector\":{\"matchLabels\":{\"app.kubernetes.io/name\":\"litellm\"}}}]"]
+              L.info(f"Running: {' '.join(cmd[:8])}...")
+              r=subprocess.run(cmd,capture_output=True,text=True,env=env,timeout=540)
+              L.info(f"stdout: {r.stdout}")
+              if r.returncode!=0:
+                L.error(f"stderr: {r.stderr}")
+                send_cfn(event,ctx,"FAILED",reason=r.stderr[:256]);return
+              # --- SAFETY NET: master key must be strong + never the old public one ---
+              # The master key is required (it signs the SSO UI JWT) but is made
+              # read-only by the custom_auth hook. Defence-in-depth: after every
+              # deploy, scan the litellm namespace and, if any "*masterkey*" Secret
+              # holds the historical hardcoded/public value (or an empty value that
+              # would break SSO login), replace it with a strong random key and
+              # restart the deployment. Non-fatal (best-effort).
+              if props.get("LiteLLMConfig"):
+                try:
+                  import secrets as _secrets
+                  BANNED={"sk-litellm-proxy-master-key",""}  # public/legacy + empty
+                  http=urllib3.PoolManager(cert_reqs="CERT_REQUIRED",ca_certs=ca_file.name)
+                  tok=get_token(sess,cn,region)
+                  hd_g={"Authorization":f"Bearer {tok}","Accept":"application/json"}
+                  sr=http.request("GET",f"{ep}/api/v1/namespaces/{ns}/secrets",headers=hd_g)
+                  rotated=False
+                  if sr.status==200:
+                    for s in json.loads(sr.data.decode()).get("items",[]):
+                      snm=s.get("metadata",{}).get("name","")
+                      if "masterkey" not in snm.lower():continue
+                      data=s.get("data",{}) or {}
+                      fix={}
+                      for dk,dv in data.items():
+                        try:val=base64.b64decode(dv).decode() if dv else ""
+                        except Exception:val="?"
+                        if val.strip() in BANNED:
+                          fix[dk]=base64.b64encode(f"sk-cnf-{_secrets.token_urlsafe(32)}".encode()).decode()
+                      if fix:
+                        L.warning(f"Master key Secret '{snm}' had weak/banned value(s) {list(fix.keys())}; rotating to strong random")
+                        patch=json.dumps({"data":fix}).encode()
+                        hd_p={"Authorization":f"Bearer {tok}","Content-Type":"application/merge-patch+json","Accept":"application/json"}
+                        pr=http.request("PATCH",f"{ep}/api/v1/namespaces/{ns}/secrets/{snm}",headers=hd_p,body=patch)
+                        L.info(f"Rotate Secret {snm}: HTTP {pr.status}");rotated=True
+                      else:
+                        L.info(f"Master key Secret '{snm}' is strong (OK)")
+                  else:
+                    L.warning(f"Secret list for master-key scan returned HTTP {sr.status}")
+                  if rotated:
+                    tok=get_token(sess,cn,region)
+                    hd_r={"Authorization":f"Bearer {tok}","Content-Type":"application/strategic-merge-patch+json","Accept":"application/json"}
+                    rp=json.dumps({"spec":{"template":{"metadata":{"annotations":{"cnf.masterkey/rotatedAt":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())}}}}}).encode()
+                    rr=http.request("PATCH",f"{ep}/apis/apps/v1/namespaces/{ns}/deployments/{release}",headers=hd_r,body=rp)
+                    L.info(f"Restart deployment {release} after rotate: HTTP {rr.status}")
+                except Exception as mke:
+                  L.warning(f"Master key safety-net (non-fatal): {mke}")
+              send_cfn(event,ctx,"SUCCESS",data={"Release":release,"Namespace":ns},pid="helm-deploy")
+            except Exception as e:
+              L.exception("fail");send_cfn(event,ctx,"FAILED",reason=str(e)[:256])
+
+  HelmDeploy:
+    Type: Custom::HelmDeploy
+    DependsOn:
+      - LiteLLMDeploy
+      - CognitoOidcSetup
+    Properties:
+      ServiceToken: !GetAtt HelmDeployFunction.Arn
+      ClusterName: !Ref EksCluster
+      Region: !Ref "AWS::Region"
+      Namespace: !Sub "cnf-${EnvironmentId}"
+      ReleaseName: !Sub "cnf-${EnvironmentId}"
+      ChartRef: "oci://public.ecr.aws/b1y9i2f3/cnf"
+      ChartVersion: "0.2.0"
+      UserPoolId: !Ref CognitoUserPool
+      ClientId: !Ref CognitoUserPoolClient
+      HelmSets:
+        global.gatewayNamespace: envoy-gateway-system
+        scaffolding.host.frontend: !GetAtt CloudFrontDistribution.DomainName
+        scaffolding.host.backend: !GetAtt GlobalAccelerator.DualStackDnsName
+        scaffolding.irsaRoleArn: !GetAtt PodRole.Arn
+        scaffolding.rootPath: !Ref AppRootPath
+
+  # --- LiteLLM Helm Deployment ---
+  LiteLLMDeploy:
+    Type: Custom::HelmDeploy
+    DependsOn:
+      - K8sAppResources
+      - GAHttpsSetup
+      - LiteLLMCognitoClient
+      - LiteLLMManagedLoginBranding
+      - ValkeyCache
+    Properties:
+      ServiceToken: !GetAtt HelmDeployFunction.Arn
+      ClusterName: !Ref EksCluster
+      Region: !Ref "AWS::Region"
+      Namespace: litellm
+      ReleaseName: litellm
+      ChartRef: "oci://docker.litellm.ai/berriai/litellm-helm"
+      ChartVersion: "1.91.0"
+      UserPoolId: !Ref CognitoUserPool
+      ClientId: !Ref LiteLLMCognitoClient
+      AuroraEndpoint: !GetAtt AuroraCluster.Endpoint.Address
+      EnvironmentId: !Ref EnvironmentId
+      BedrockWildcardRegion: !FindInMap [BedrockConfig, !Ref "AWS::Region", WildcardRegion]
+      ValkeyHost: !GetAtt ValkeyCache.Endpoint.Address
+      ValkeyPort: !GetAtt ValkeyCache.Endpoint.Port
+      ValkeyPassword: !Sub "${ProjectName}${EnvironmentId}Valkey2026!"
+      LiteLLMConfig: "true"
+      LiteLLMEnv:
+        SERVER_ROOT_PATH: ""
+        PROXY_BASE_URL: !Sub "https://${CloudFrontDistribution.DomainName}"
+        CLOUDFRONT_HOST: !GetAtt CloudFrontDistribution.DomainName
+        GENERIC_CLIENT_STATE: "litellm-sso"
+        AUTO_REDIRECT_UI_LOGIN_TO_SSO: "true"
+        GENERIC_ROLE_MAPPINGS_GROUP_CLAIM: "groups"
+        GENERIC_ROLE_MAPPINGS_ROLES: "{'proxy_admin': ['admin']}"
+        LITELLM_MODE: "PRODUCTION"
+        LITELLM_LOG: "ERROR"
+
+  # ============================================================================
+  # SECTION 10.1: GA HTTPS RESOURCES (Certificate + Listener + Route)
+  # ============================================================================
+
+  # When GA is enabled, create Let's Encrypt cert and HTTPS listener for GA hostname
+  GAHttpsSetup:
+    Type: Custom::K8sApp
+    DependsOn:
+      - K8sAppResources
+      - GlobalAccelerator
+    Properties:
+      ServiceToken: !GetAtt KubectlFunction.Arn
+      ClusterName: !Ref EksCluster
+      Region: !Ref "AWS::Region"
+      Manifests:
+        # --- Certificate for GA hostname ---
+        - apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: ga-cert
+            namespace: envoy-gateway-system
+          spec:
+            secretName: ga-https-cert
+            issuerRef:
+              name: letsencrypt-gateway
+              kind: ClusterIssuer
+            dnsNames:
+              - !GetAtt GlobalAccelerator.DualStackDnsName
+        # --- Patch Gateway: https=GA(default) ---
+        - apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata:
+            name: eg
+            namespace: envoy-gateway-system
+            annotations:
+              cert-manager.io/cluster-issuer: letsencrypt-gateway
+          spec:
+            gatewayClassName: !Sub "cnf-${EnvironmentId}-eg"
+            infrastructure:
+              parametersRef:
+                group: gateway.envoyproxy.io
+                kind: EnvoyProxy
+                name: custom-proxy-config
+            listeners:
+              - name: http
+                port: 80
+                protocol: HTTP
+                allowedRoutes:
+                  namespaces:
+                    from: All
+              - name: https
+                port: 443
+                protocol: HTTPS
+                allowedRoutes:
+                  namespaces:
+                    from: All
+                tls:
+                  mode: Terminate
+                  certificateRefs:
+                    - kind: Secret
+                      name: ga-https-cert
+                    - kind: Secret
+                      name: eg-https-cert
+        # --- ClientTrafficPolicy for HTTP/2 ---
+        - apiVersion: gateway.envoyproxy.io/v1alpha1
+          kind: ClientTrafficPolicy
+          metadata:
+            name: enable-h2
+            namespace: envoy-gateway-system
+          spec:
+            targetRefs:
+            - group: gateway.networking.k8s.io
+              kind: Gateway
+              name: eg
+            connection:
+              connectionLimit:
+                value: 10000
+              maxAcceptPerSocketEvent: 1
+            http1:
+              preserveHeaderCase: true
+            http2:
+              initialConnectionWindowSize: 268435456
+              initialStreamWindowSize: 268435456
+              maxConcurrentStreams: 1000
+            timeout:
+              http:
+                requestReceivedTimeout: 0s
+
+  # ============================================================================
+  # SECTION 11: COGNITO OIDC - SecurityPolicy (EnvoyGateway)
+  # ============================================================================
+
+  # Lambda to update Cognito callback URLs and create SecurityPolicy
+  CognitoSecretFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: QuotaCheck
+    Properties:
+      FunctionName: !Sub "${ProjectName}${EnvironmentId}-cognito-setup"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 256
+      Role: !GetAtt KubectlLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import base64,json,logging,tempfile,urllib3,boto3
+          from botocore.signers import RequestSigner
+          L=logging.getLogger();L.setLevel(logging.INFO)
+          def send_cfn(event,ctx,status,data=None,reason=None,pid=None):
+            body=json.dumps({"Status":status,"Reason":reason or f"Logs: {ctx.log_stream_name}","PhysicalResourceId":pid or event.get("PhysicalResourceId",ctx.log_stream_name),"StackId":event["StackId"],"RequestId":event["RequestId"],"LogicalResourceId":event["LogicalResourceId"],"Data":data or{}})
+            urllib3.PoolManager().request("PUT",event["ResponseURL"],body=body.encode(),headers={"Content-Type":""})
+          def get_token(sess,cluster,region):
+            sts=sess.client("sts",region_name=region);si=sts.meta.service_model.service_id
+            sg=RequestSigner(si,region,"sts","v4",sess.get_credentials(),sess.events)
+            p={"method":"GET","url":f"https://sts.{region}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15","body":{},"headers":{"x-k8s-aws-id":cluster},"context":{}}
+            u=sg.generate_presigned_url(p,region_name=region,expires_in=60,operation_name="")
+            return "k8s-aws-v1."+base64.urlsafe_b64encode(u.encode()).decode().rstrip("=")
+          def k8s_apply(http,ep,token,m):
+            av=m.get("apiVersion","");kind=m.get("kind","");name=m["metadata"]["name"];ns=m["metadata"].get("namespace")
+            PLURALS={"SecurityPolicy":"securitypolicies","Secret":"secrets","HTTPRoute":"httproutes"}
+            pl=PLURALS.get(kind,kind.lower()+"s")
+            px=f"apis/{av}" if "/" in av else f"api/{av}"
+            p=f"/{px}/namespaces/{ns}/{pl}" if ns else f"/{px}/{pl}"
+            hd={"Authorization":f"Bearer {token}","Content-Type":"application/json","Accept":"application/json"}
+            b=json.dumps(m).encode()
+            r=http.request("POST",f"{ep}{p}",headers=hd,body=b)
+            if r.status==409:
+              hd["Content-Type"]="application/merge-patch+json"
+              r=http.request("PATCH",f"{ep}{p}/{name}",headers=hd,body=b)
+            L.info(f"k8s_apply {kind}/{name}: {r.status}")
+            return r.status
+          def handler(event,ctx):
+            L.info(json.dumps(event,default=str))
+            rt=event["RequestType"];props=event["ResourceProperties"]
+            if rt=="Delete":
+              send_cfn(event,ctx,"SUCCESS",pid="cognito-setup");return
+            try:
+              region=props.get("Region",boto3.session.Session().region_name)
+              pool_id=props["UserPoolId"];client_id=props["ClientId"]
+              cluster=props["ClusterName"];ga_dns=props.get("GADualStackDns","")
+              app_root=props.get("AppRootPath","/app")
+              gw_ns=props.get("GatewayNamespace","envoy-gateway-system")
+              sess=boto3.Session(region_name=region)
+              cog=sess.client("cognito-idp")
+              # Get client secret
+              resp=cog.describe_user_pool_client(UserPoolId=pool_id,ClientId=client_id)
+              secret=resp["UserPoolClient"].get("ClientSecret","")
+              issuer=f"https://cognito-idp.{region}.amazonaws.com/{pool_id}"
+              # Update callback URLs
+              callbacks=[];logouts=[]
+              cf_domain=props.get("CloudFrontDomain","")
+              for d in [cf_domain,ga_dns]:
+                if d:
+                  callbacks.append(f"https://{d}{app_root}/auth/oidc/callback")
+                  logouts.append(f"https://{d}{app_root}/auth/oidc/logout")
+              if not callbacks:
+                callbacks=["https://localhost"+app_root+"/auth/oidc/callback"];logouts=["https://localhost"+app_root+"/auth/oidc/logout"]
+              L.info(f"Updating Cognito callbacks: {callbacks}")
+              cog.update_user_pool_client(UserPoolId=pool_id,ClientId=client_id,
+                CallbackURLs=callbacks,LogoutURLs=logouts,
+                AllowedOAuthFlows=["code"],AllowedOAuthFlowsUserPoolClient=True,
+                AllowedOAuthScopes=["openid","profile","email"],
+                SupportedIdentityProviders=["COGNITO"],
+                ExplicitAuthFlows=["ALLOW_USER_AUTH","ALLOW_USER_SRP_AUTH","ALLOW_REFRESH_TOKEN_AUTH"])
+              # --- Create K8s resources for SecurityPolicy ---
+              if cluster:
+                eks=sess.client("eks");ci=eks.describe_cluster(name=cluster)["cluster"]
+                ep=ci["endpoint"];ca=ci["certificateAuthority"]["data"]
+                tf=tempfile.NamedTemporaryFile(delete=False,suffix=".crt")
+                tf.write(base64.b64decode(ca));tf.flush();tf.close()
+                token=get_token(sess,cluster,region)
+                http=urllib3.PoolManager(cert_reqs="CERT_REQUIRED",ca_certs=tf.name)
+                # K8s Secret with Cognito client secret
+                k8s_apply(http,ep,token,{"apiVersion":"v1","kind":"Secret","metadata":{"name":"cognito-oidc-secret","namespace":gw_ns},"type":"Opaque","data":{"client-secret":base64.b64encode(secret.encode()).decode()}})
+                # --- GA /apis/v1/: scoped HTTPRoute + SecurityPolicy ---
+                if ga_dns:
+                  k8s_apply(http,ep,token,{"apiVersion":"gateway.networking.k8s.io/v1","kind":"HTTPRoute","metadata":{"name":"apis-v1-ga","namespace":gw_ns},"spec":{"parentRefs":[{"name":"eg","namespace":gw_ns,"sectionName":"https"}],"hostnames":[ga_dns],"rules":[{"matches":[{"path":{"type":"PathPrefix","value":"/apis/v1/"}}]}]}})
+                  k8s_apply(http,ep,token,{"apiVersion":"gateway.envoyproxy.io/v1alpha1","kind":"SecurityPolicy","metadata":{"name":"cognito-oidc-apis-v1","namespace":gw_ns},"spec":{"targetRefs":[{"group":"gateway.networking.k8s.io","kind":"HTTPRoute","name":"apis-v1-ga"}],"oidc":{"provider":{"issuer":issuer},"clientID":client_id,"clientSecret":{"group":"","kind":"Secret","name":"cognito-oidc-secret"},"redirectURL":f"https://{ga_dns}/apis/v1{app_root}/auth/oidc/callback","scopes":["openid","profile","email"],"forwardAccessToken":True}}})
+                  L.info("SecurityPolicy cognito-oidc-apis-v1 applied")
+              send_cfn(event,ctx,"SUCCESS",data={"CognitoIssuer":issuer,"ClientSecret":secret},pid="cognito-setup")
+            except Exception as e:
+              L.exception("fail");send_cfn(event,ctx,"FAILED",reason=str(e)[:256])
+
+  CognitoOidcSetup:
+    Type: Custom::CognitoSetup
+    DependsOn:
+      - K8sAppResources
+      - CognitoUserPoolClient
+      - GAHttpsSetup
+    Properties:
+      ServiceToken: !GetAtt CognitoSecretFunction.Arn
+      ClusterName: !Ref EksCluster
+      Region: !Ref "AWS::Region"
+      UserPoolId: !Ref CognitoUserPool
+      ClientId: !Ref CognitoUserPoolClient
+      CloudFrontDomain: !GetAtt CloudFrontDistribution.DomainName
+      GADualStackDns: !GetAtt GlobalAccelerator.DualStackDnsName
+      AppRootPath: !Ref AppRootPath
+      GatewayNamespace: envoy-gateway-system
+
+  # ============================================================================
+  # SECTION 12: POST-DEPLOY NLB HEALTH CHECK
+  # ============================================================================
+
+  # Ensures NLB port 80 listener exists after all Gateway updates.
+  # EKS Auto Mode's LB controller can lose listeners during Gateway reconcile.
+  NlbHealthCheck:
+    Type: Custom::NlbHealthCheck
+    DependsOn:
+      - HelmDeploy
+      - CognitoOidcSetup
+    Properties:
+      ServiceToken: !GetAtt NlbLookupFunction.Arn
+      ClusterName: !Ref EksCluster
+      Namespace: !Sub "cnf-${EnvironmentId}"
+      Region: !Ref "AWS::Region"
+      NlbArn: !GetAtt NlbLookup.NlbArn
+      NlbDns: !GetAtt NlbLookup.NlbDns
+      RequiredPort: 80
+      CloudFrontUrl: !Sub "http://${CloudFrontDistribution.DomainName}/health/readiness"
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  StackName:
+    Description: "Stack Name"
+    Value: !Sub "${ProjectName}${EnvironmentId}"
+
+  VpcId:
+    Description: "VPC ID"
+    Value: !Ref VPC
+
+  EksClusterName:
+    Description: "EKS Cluster Name"
+    Value: !Ref EksCluster
+
+  EksClusterEndpoint:
+    Description: "EKS Cluster API Endpoint"
+    Value: !GetAtt EksCluster.Endpoint
+
+  EfsFileSystemId:
+    Description: "EFS File System ID"
+    Value: !Ref EfsFileSystem
+
+  CognitoUserPoolId:
+    Description: "Cognito User Pool ID"
+    Value: !Ref CognitoUserPool
+
+  CognitoUserPoolClientId:
+    Description: "Cognito App Client ID"
+    Value: !Ref CognitoUserPoolClient
+
+  CognitoUserPoolClientSecret:
+    Description: "Cognito App Client Secret"
+    Value: !GetAtt CognitoOidcSetup.ClientSecret
+
+  CognitoAdminUsername:
+    Description: "Cognito Admin Username"
+    Value: !GetAtt CognitoAdminUser.Username
+
+  CognitoAdminPassword:
+    Description: "Cognito Admin Password (SAVE THIS - shown only once)"
+    Value: !GetAtt CognitoAdminUser.Password
+
+  CognitoOidcIssuer:
+    Description: "Cognito OIDC Issuer URL"
+    Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}"
+
+  PodRoleArn:
+    Description: "Pod IAM Role ARN (IRSA/Pod Identity)"
+    Value: !GetAtt PodRole.Arn
+
+  NlbDns:
+    Description: "EnvoyGateway NLB DNS Name"
+    Value: !GetAtt NlbLookup.NlbDns
+
+  CloudFrontDomain:
+    Description: "CloudFront Domain Name (frontend host)"
+    Value: !GetAtt CloudFrontDistribution.DomainName
+
+  GlobalAcceleratorHost:
+    Description: "Global Accelerator Dual-Stack DNS (backend host)"
+    Value: !GetAtt GlobalAccelerator.DualStackDnsName
+
+  ValkeyEndpoint:
+    Description: "ElastiCache Serverless (Valkey) Endpoint"
+    Value: !GetAtt ValkeyCache.Endpoint.Address
+  ValkeyPort:
+    Description: "ElastiCache Serverless (Valkey) Port"
+    Value: !GetAtt ValkeyCache.Endpoint.Port
+  ValkeyPassword:
+    Description: "Valkey Password"
+    Value: !Sub "${ProjectName}${EnvironmentId}Valkey2026!"
+  DynamoDBTableName:
+    Description: "DynamoDB Sessions Table Name"
+    Value: !Ref SessionTable
+  AuroraEndpoint:
+    Description: "Aurora PostgreSQL Endpoint"
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+  AuroraUsername:
+    Description: "Aurora PostgreSQL Username"
+    Value: pgadmin
+  AuroraPassword:
+    Description: "Aurora PostgreSQL Password"
+    Value: !Sub "${ProjectName}${EnvironmentId}Pg2026!"
+  LiteLLMApiServer:
+    Description: "LiteLLM API Server (GA)"
+    Value: !Sub "https://${GlobalAccelerator.DualStackDnsName}/"
+  LiteLLMAdminUI:
+    Description: "LiteLLM Admin UI (CloudFront)"
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}/ui/"
+  LiteLLMMasterKey:
+    Description: >-
+      LiteLLM master key (READ-ONLY). This key can only read usage/statistics
+      (/spend/*, /global/spend, /*/info, /models). It CANNOT call models or
+      create/modify/delete API keys - those return 403 via the custom_auth
+      hook. Safe to expose here: it is scope-restricted, so it is not a
+      privilege-escalation vector. Model access requires an SSO-issued admin
+      virtual key. Value mirrors the litellm-masterkey Secret exactly.
+    Value: !Sub
+      - "sk-cnf-${Guid}"
+      - Guid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
