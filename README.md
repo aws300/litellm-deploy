@@ -2,6 +2,8 @@
 
 一份 CloudFormation 模板，一次点击部署完整的 LiteLLM 云原生栈：VPC(IPv6 双栈) + EKS(Auto Mode, 1.35) + EnvoyGateway + CloudFront + Global Accelerator + Cognito SSO + Aurora Postgres Serverless + ElastiCache Serverless(Valkey) + DynamoDB + LiteLLM Helm。已在 `ap-northeast-2` / `ap-southeast-1` 验证通过。
 
+> 面向运维的纯控制台操作手册（一键部署 / 逐项手动创建、每个 IAM 角色的完整 JSON、一键卸载与逐个卸载）见 [docs/console-deployment.md](docs/console-deployment.md)。
+
 ---
 
 ## 前置条件
