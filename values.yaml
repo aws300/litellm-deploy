@@ -1,80 +1,134 @@
-# LiteLLM Helm values — v1.83.14-stable.patch.3
-# 与集群实际状态完全一致（2026-05-09）
-# Chart: oci://ghcr.io/berriai/litellm-helm
+# LiteLLM Helm values — v1.106.6 (chart oci://docker.litellm.ai/berriai/litellm-helm 1.106.6)
+#
+# The standalone-Helm form of what CloudNativeFormationLitellm.yaml deploys
+# (resource LiteLLMDeploy, whose LiteLLMValues JSON is the source of these
+# settings): same image, security settings and model list. Use it to run the
+# same LiteLLM on an existing EKS cluster without the stack:
+#
+#   kubectl create namespace litellm
+#   kubectl create secret generic litellm-masterkey -n litellm \
+#     --from-literal=masterkey="sk-$(openssl rand -hex 24)"
+#   kubectl create secret generic postgres-creds -n litellm \
+#     --from-literal=username=<db user> --from-literal=password=<db password>
+#   kubectl create secret generic litellm-env -n litellm \
+#     --from-literal=GENERIC_CLIENT_SECRET=<cognito app client secret> \
+#     --from-literal=REDIS_PASSWORD=<valkey password>
+#   kubectl create configmap litellm-policy -n litellm \
+#     --from-file=../base/scripts/litellm/access_policy.py \
+#     --from-file=scripts/edge_policy.py
+#   helm upgrade --install litellm oci://docker.litellm.ai/berriai/litellm-helm \
+#     --version 1.106.6 -n litellm -f values.yaml
+#
+# and replace every <...> below. Bedrock credentials come from ServiceAccount
+# litellm-sa (EKS Pod Identity / IRSA; bedrock:InvokeModel* and
+# bedrock-mantle:CreateInference) — no AWS keys anywhere.
+#
+# Security (as base/templates/labs/litellm.yaml):
+#   - model calls only with a virtual key: access_policy.py makes the master key
+#     read-only (GET statistics; model calls and writes such as /key/generate ->
+#     403) and disable_env_credential_login stops it signing in to the UI;
+#   - edge_policy.py refuses model calls that arrive through CloudFront
+#     (X-LiteLLM-Edge: cloudfront set by the HTTPRoute, or CloudFront's
+#     X-CloudFront-Secret origin header): the API is served on GA only;
+#   - every team / personal key must carry a budget (key_generation_settings);
+#   - no prompt / response text in the spend logs.
+# The two .py files are imported at startup and patch LiteLLM internals of this
+# exact version: re-run scripts/e2e-test.sh on every image tag change.
+#
+# The semantic auto-router and the cost-attribution hook of docs/litellm/ are
+# separate add-ons (their own ConfigMaps + callbacks); they are not enabled here.
 
-# ── CLI 启动参数 ─────────────────────────────────────────────────
-args:
-  - --config
-  - /etc/litellm/config.yaml
-  - --host
-  - '::'
+image:
+  repository: ghcr.io/berriai/litellm
+  tag: v1.106.6
+  pullPolicy: IfNotPresent
 
-# ── 数据库（外部 RDS）────────────────────────────────────────────
+# Existing Secret (see above); the chart then creates no master-key Secret.
+masterkeySecretName: litellm-masterkey
+masterkeySecretKey: masterkey
+
+serviceAccount:
+  create: false
+  name: litellm-sa
+
+service:
+  type: ClusterIP
+  port: 4000
+
+# ── Database (Aurora PostgreSQL / RDS) ───────────────────────────
 db:
-  database: litellm
+  useExisting: true
   deployStandalone: false
-  endpoint: nxdev-pg.cluster-cfgoawqmcki9.us-west-2.rds.amazonaws.com
+  endpoint: <aurora cluster endpoint>
+  database: litellm
+  url: postgresql://$(DATABASE_USERNAME):$(DATABASE_PASSWORD)@$(DATABASE_HOST):5432/$(DATABASE_NAME)
   secret:
     name: postgres-creds
-    passwordKey: password
     usernameKey: username
-  url: postgresql://$(DATABASE_USERNAME):$(DATABASE_PASSWORD)@$(DATABASE_HOST):5432/$(DATABASE_NAME)
-  useExisting: true
+    passwordKey: password
 
-# ── 环境变量 ────────────────────────────────────────────────────
-envVars:
-  # SSO — AWS Cognito
-  AUTO_REDIRECT_UI_LOGIN_TO_SSO: true
-  GENERIC_AUTHORIZATION_ENDPOINT: https://cnf-dev-867344450900.auth.us-west-2.amazoncognito.com/oauth2/authorize
-  GENERIC_CLIENT_ID: 3okkkpoeplqvc65fd2nmrng88t
-  GENERIC_CLIENT_SECRET: 1o3naif8jv94emj2r3htmvp3e9qvscroj6uaqacnfk9035v6vav2
-  GENERIC_CLIENT_STATE: litellm-sso
-  GENERIC_ROLE_MAPPINGS_GROUP_CLAIM: groups
-  GENERIC_ROLE_MAPPINGS_ROLES: "{'proxy_admin': ['admin']}"
-  GENERIC_TOKEN_ENDPOINT: https://cnf-dev-867344450900.auth.us-west-2.amazoncognito.com/oauth2/token
-  GENERIC_USERINFO_ENDPOINT: https://cnf-dev-867344450900.auth.us-west-2.amazoncognito.com/oauth2/userInfo
-  # 日志 / 模式
-  LITELLM_LOG: ERROR
-  LITELLM_MODE: PRODUCTION
-  # 端点
-  PROXY_BASE_URL: https://d3sdxccbfn7y3d.cloudfront.net
-  PROXY_LOGOUT_URL: "https://cnf-dev-867344450900.auth.us-west-2.amazoncognito.com/logout?client_id=3okkkpoeplqvc65fd2nmrng88t&logout_uri=https://d3sdxccbfn7y3d.cloudfront.net/ui/"
-  # Redis / Valkey
-  REDIS_HOST: nxdev-valkey-5mrhn9.serverless.usw2.cache.amazonaws.com
-  REDIS_PASSWORD: nxdevValkey2026!
-  REDIS_PORT: 6379
-  REDIS_SSL: true
-  SERVER_ROOT_PATH: ""
-  # semantic-router LiteLLMEncoder 初始化需要（实际认证走 Pod Identity）
-  BEDROCK_API_KEY: placeholder
-
-# ── Ingress ─────────────────────────────────────────────────────
+migrationJob:
+  enabled: true
+redis:
+  enabled: false
 ingress:
   enabled: false
 
-# ── 健康探针 ────────────────────────────────────────────────────
-livenessProbe:
-  path: /health/liveliness
-readinessProbe:
-  path: /health/readiness
-startupProbe:
-  failureThreshold: 60
-  initialDelaySeconds: 30
-  path: /health/readiness
-  periodSeconds: 10
+# The cluster is IPv6-only: without --host '::' uvicorn binds 0.0.0.0 and every
+# probe gets ECONNREFUSED.
+args: ["--config", "/etc/litellm/config.yaml", "--host", "::", "--num_workers", "4"]
 
-# ── 主密钥 ──────────────────────────────────────────────────────
-masterkey: sk-litellm-proxy-master-key
-
-# ── 迁移 Job（ArgoCD PreSync hook）──────────────────────────────
-migrationJob:
-  enabled: true
-
-# ── 节点选择（arm64 节点）──────────────────────────────────────
 nodeSelector:
   kubernetes.io/arch: arm64
 
-# ── Topology Spread（高可用时跨 AZ 和节点分布）──────────────────
+# 10s timeouts: a saturated worker must not be restarted by its liveness probe.
+startupProbe:
+  path: /health/readiness
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 10
+  failureThreshold: 60
+livenessProbe:
+  path: /health/liveliness
+  periodSeconds: 15
+  timeoutSeconds: 10
+  failureThreshold: 6
+readinessProbe:
+  path: /health/readiness
+  periodSeconds: 10
+  timeoutSeconds: 10
+  failureThreshold: 3
+
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 25%
+
+# Per pod (num_workers 4, idle ~3.7Gi): memory request == limit, so the node
+# never over-commits memory and a neighbour cannot get this pod OOM-killed;
+# CPU limit 2x the request for bursts. One pod per m8g.xlarge. Scale with an
+# HPA on CPU only (min 3, max 30, 60% of the request) — memory is a fixed
+# baseline and a memory target pins the HPA at maxReplicas.
+resources:
+  requests:
+    cpu: 2000m
+    memory: 10Gi
+  limits:
+    cpu: 4000m
+    memory: 10Gi
+
+# preStop: Envoy drops the endpoint before the pod stops accepting; grace =
+# the 600s request timeout + drain, so a scale-in never cuts a long stream.
+terminationGracePeriodSeconds: 660
+lifecycle:
+  preStop:
+    exec:
+      command: ["/usr/bin/sleep", "20"]
+pdb:
+  enabled: true
+  maxUnavailable: 1
+
 topologySpreadConstraints:
   - maxSkew: 1
     topologyKey: topology.kubernetes.io/zone
@@ -89,170 +143,388 @@ topologySpreadConstraints:
       matchLabels:
         app.kubernetes.io/name: litellm
 
-# ── HPA ─────────────────────────────────────────────────────────
-autoscaling:
-  enabled: true
-  minReplicas: 1
-  maxReplicas: 500
-  targetCPUUtilizationPercentage: 70
-
-# ── 资源限制 ────────────────────────────────────────────────────
-resources:
-  limits:
-    cpu: 2000m
-    memory: 4Gi
-  requests:
-    cpu: 500m
-    memory: 1Gi
-
-# ── 额外 Volumes（原生支持，替代之前的手动 kubectl patch）────────
+# The policy callbacks, next to config.yaml (where LiteLLM resolves them).
 volumes:
-  # custom_callbacks.py — 请求预处理（参数清洗、auto-router flatten）
-  - name: custom-callbacks
+  - name: litellm-policy
     configMap:
-      name: litellm-custom-callbacks
-      defaultMode: 420
-  # semantic_router.json — 语义路由规则（独立 CM，不被 Helm 覆盖）
-  - name: litellm-router-config
-    configMap:
-      name: litellm-router-config
-      defaultMode: 420
-      items:
-        - key: semantic_router.json
-          path: semantic_router.json
-  # bedrock_team_tag_hook.py — AWS 成本归因 Session Tag 注入
-  - name: bedrock-team-tag-hook
-    configMap:
-      name: litellm-bedrock-team-tag-hook
-      defaultMode: 420
-
-# ── 额外 VolumeMounts ────────────────────────────────────────────
+      name: litellm-policy
 volumeMounts:
-  - name: custom-callbacks
-    mountPath: /etc/litellm/custom_callbacks.py
-    subPath: custom_callbacks.py
+  - name: litellm-policy
+    mountPath: /etc/litellm/access_policy.py
+    subPath: access_policy.py
     readOnly: true
-  - name: litellm-router-config
-    mountPath: /etc/litellm/semantic_router.json
-    subPath: semantic_router.json
-    readOnly: true
-  - name: bedrock-team-tag-hook
-    mountPath: /etc/litellm/bedrock_team_tag_hook.py
-    subPath: bedrock_team_tag_hook.py
+  - name: litellm-policy
+    mountPath: /etc/litellm/edge_policy.py
+    subPath: edge_policy.py
     readOnly: true
 
-# ── LiteLLM proxy 主配置（proxy_config → /etc/litellm/config.yaml）
+# Secrets (GENERIC_CLIENT_SECRET, REDIS_PASSWORD) from Secret litellm-env.
+environmentSecrets:
+  - litellm-env
+
+envVars:
+  LITELLM_MODE: PRODUCTION
+  LITELLM_LOG: ERROR
+  LITELLM_TELEMETRY: "False"
+  SERVER_ROOT_PATH: ""
+  # The admin UI and the SSO callback are on CloudFront; the API on GA.
+  PROXY_BASE_URL: https://<cloudfront domain>
+  # Cognito SSO (generic OIDC). Users in the Cognito group `admin` become proxy_admin.
+  AUTO_REDIRECT_UI_LOGIN_TO_SSO: "true"
+  GENERIC_CLIENT_ID: <cognito app client id>
+  GENERIC_CLIENT_STATE: litellm-sso
+  GENERIC_AUTHORIZATION_ENDPOINT: https://<cognito domain>.auth.<region>.amazoncognito.com/oauth2/authorize
+  GENERIC_TOKEN_ENDPOINT: https://<cognito domain>.auth.<region>.amazoncognito.com/oauth2/token
+  GENERIC_USERINFO_ENDPOINT: https://<cognito domain>.auth.<region>.amazoncognito.com/oauth2/userInfo
+  GENERIC_ROLE_MAPPINGS_GROUP_CLAIM: groups
+  GENERIC_ROLE_MAPPINGS_ROLES: "{'proxy_admin': ['admin']}"
+  PROXY_LOGOUT_URL: https://<cognito domain>.auth.<region>.amazoncognito.com/logout?client_id=<cognito app client id>&logout_uri=https://<cloudfront domain>/ui/
+  # ElastiCache Serverless (Valkey): response cache + router state across replicas.
+  REDIS_HOST: <valkey endpoint>
+  REDIS_PORT: "6379"
+  REDIS_SSL: "True"
+
+# ── LiteLLM proxy config (-> /etc/litellm/config.yaml) ───────────
 proxy_config:
   general_settings:
+    master_key: os.environ/PROXY_MASTER_KEY
+    # The master key cannot be the UI password; the UI is entered through SSO.
+    disable_env_credential_login: true
+    # model_list below is the whole catalogue; the UI cannot add models.
+    store_model_in_db: false
     allow_requests_on_db_unavailable: true
-    database_connection_pool_limit: 24
+    # Per worker: 4 x 10 x 30 pods = 1200 connections (Aurora MaxCapacity 8 ACU).
+    database_connection_pool_limit: 10
+    maximum_spend_logs_retention_period: 7d
+    store_prompts_in_spend_logs: false
     disable_error_logs: true
     forward_client_headers_to_llm_api: false
-    master_key: os.environ/PROXY_MASTER_KEY
-    maximum_spend_logs_retention_period: 7d
     proxy_batch_write_at: 30
-    store_prompts_in_spend_logs: true
     max_parallel_requests: 100
     global_max_parallel_requests: 500
-
   litellm_settings:
-    cache: true
-    cache_params:
-      host: nxdev-valkey-5mrhn9.serverless.usw2.cache.amazonaws.com
-      password: nxdevValkey2026!
-      port: 6379
-      ssl: true
-      ttl: 600
-      type: redis
+    # Order matters: both wrap the same auth function.
+    callbacks:
+      - access_policy.proxy_handler_instance
+      - edge_policy.proxy_handler_instance
     drop_params: true
+    set_verbose: false
     json_logs: true
     request_timeout: 600
-    set_verbose: false
-    callbacks:
-      - custom_callbacks.proxy_handler_instance         # 参数清洗 + auto-router
-      - bedrock_team_tag_hook.proxy_handler_instance    # Team Tag 成本归因（v1.83.14 新增）
-
+    cache: true
+    cache_params:
+      type: redis
+      host: os.environ/REDIS_HOST
+      port: os.environ/REDIS_PORT
+      password: os.environ/REDIS_PASSWORD
+      ssl: true
+      ttl: 600
+    key_generation_settings:
+      team_key_generation:
+        required_params: [max_budget, budget_duration]
+      personal_key_generation:
+        required_params: [max_budget, budget_duration]
+  router_settings:
+    routing_strategy: simple-shuffle
+    redis_host: os.environ/REDIS_HOST
+    redis_port: os.environ/REDIS_PORT
+    redis_password: os.environ/REDIS_PASSWORD
+  # The Bedrock models litellm-model-discovery selects for base/
+  # (docker/litellm-model-discovery/configs/config.yaml): Claude >= 5.5 via
+  # InvokeModel (global profiles, prompt-cache points injected), GPT >= 6 via
+  # bedrock-mantle's Responses API in us-east-1, GLM >= 5.3, Kimi >= 3 (no
+  # prompt caching on Bedrock), Cohere embed >= 4 — same names, backends,
+  # prices and capabilities as it writes (base /model/info, 2026-10-29).
   model_list:
-    # ───── Frontier Anthropic ─────
-    - model_name: claude-opus-4-7
+    - model_name: claude-opus-5-5
       litellm_params:
-        model: bedrock/global.anthropic.claude-opus-4-7
-    - model_name: claude-opus-4-6
-      litellm_params:
-        model: bedrock/global.anthropic.claude-opus-4-6-v1
-    - model_name: claude-sonnet-4-6
-      litellm_params:
-        model: bedrock/global.anthropic.claude-sonnet-4-6
-    - model_name: claude-sonnet-4-5-20250929
-      litellm_params:
-        model: bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0
-    - model_name: claude-opus-4-5-20251101
-      litellm_params:
-        model: bedrock/global.anthropic.claude-opus-4-5-20251101-v1:0
-    - model_name: claude-haiku-4-5-20251001
-      litellm_params:
-        model: bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0
-
-    # ───── 低价代码生成 ─────
-    - model_name: qwen3-coder-480b
-      litellm_params:
-        model: bedrock/qwen.qwen3-coder-480b-a35b-v1:0
+        model: bedrock/invoke/global.anthropic.claude-opus-5-5
         aws_region_name: us-west-2
-
-    # ───── 开源替代模型 ─────
-    - model_name: kimi-k2.5
+        input_cost_per_token: 4.0e-06
+        output_cost_per_token: 2.0e-05
+        cache_read_input_token_cost: 2.0e-07
+        cache_creation_input_token_cost: 5.0e-06
+        cache_creation_input_token_cost_above_1hr: 8.0e-06
+        cache_control_injection_points:
+        - role: system
+          location: message
+        - index: -1
+          location: message
+      model_info:
+        max_input_tokens: 1000000
+        max_output_tokens: 128000
+        max_tokens: 128000
+        mode: chat
+        supports_adaptive_thinking: true
+        supports_computer_use: true
+        supports_function_calling: true
+        supports_max_reasoning_effort: true
+        supports_mid_conversation_system: true
+        supports_output_config: true
+        supports_parallel_tool_use_config: true
+        supports_pdf_input: true
+        supports_prompt_caching: true
+        supports_reasoning: true
+        supports_response_schema: true
+        supports_tool_choice: true
+        supports_tool_search: true
+        supports_vision: true
+        supports_xhigh_reasoning_effort: true
+    - model_name: claude-sonnet-5-5
       litellm_params:
-        model: bedrock/moonshotai.kimi-k2.5
+        model: bedrock/invoke/global.anthropic.claude-sonnet-5-5
         aws_region_name: us-west-2
-    - model_name: zai.glm-5
+        input_cost_per_token: 2.0e-06
+        output_cost_per_token: 1.0e-05
+        cache_read_input_token_cost: 1.0e-07
+        cache_creation_input_token_cost: 2.5e-06
+        cache_creation_input_token_cost_above_1hr: 4.0e-06
+        cache_control_injection_points:
+        - role: system
+          location: message
+        - index: -1
+          location: message
+      model_info:
+        max_input_tokens: 1000000
+        max_output_tokens: 128000
+        max_tokens: 128000
+        mode: chat
+        supports_adaptive_thinking: true
+        supports_bedrock_native_structured_output: true
+        supports_computer_use: true
+        supports_function_calling: true
+        supports_max_reasoning_effort: true
+        supports_mid_conversation_system: true
+        supports_output_config: true
+        supports_parallel_tool_use_config: true
+        supports_pdf_input: true
+        supports_prompt_caching: true
+        supports_reasoning: true
+        supports_response_schema: true
+        supports_tool_choice: true
+        supports_tool_search: true
+        supports_vision: true
+        supports_xhigh_reasoning_effort: true
+    - model_name: claude-haiku-5-5
       litellm_params:
-        model: bedrock/zai.glm-5
+        model: bedrock/invoke/global.anthropic.claude-haiku-5-5
         aws_region_name: us-west-2
-    - model_name: deepseek-v3.2
+        input_cost_per_token: 1.0e-07
+        output_cost_per_token: 5.0e-07
+        cache_read_input_token_cost: 1.0e-08
+        cache_creation_input_token_cost: 1.25e-07
+        cache_creation_input_token_cost_above_1hr: 2.0e-07
+        cache_control_injection_points:
+        - role: system
+          location: message
+        - index: -1
+          location: message
+      model_info:
+        max_input_tokens: 1000000
+        max_output_tokens: 128000
+        max_tokens: 128000
+        mode: chat
+        supports_adaptive_thinking: true
+        supports_bedrock_native_structured_output: true
+        supports_computer_use: true
+        supports_forced_tool_use: true
+        supports_function_calling: true
+        supports_max_reasoning_effort: true
+        supports_mid_conversation_system: true
+        supports_output_config: true
+        supports_parallel_tool_use_config: true
+        supports_pdf_input: true
+        supports_prompt_caching: true
+        supports_reasoning: true
+        supports_response_schema: true
+        supports_tool_choice: true
+        supports_tool_search: true
+        supports_vision: true
+        supports_xhigh_reasoning_effort: true
+    - model_name: gpt-6-astra
       litellm_params:
-        model: bedrock/deepseek.v3.2
+        model: bedrock_mantle/openai.gpt-6-astra
+        aws_region_name: us-east-1
+        input_cost_per_token: 1.1e-05
+        output_cost_per_token: 5.5e-05
+        cache_read_input_token_cost: 1.1e-06
+        cache_creation_input_token_cost: 1.375e-05
+        cache_creation_input_token_cost_above_272k_tokens: 2.75e-05
+        cache_read_input_token_cost_above_272k_tokens: 2.2e-06
+        input_cost_per_token_above_272k_tokens: 2.2e-05
+        output_cost_per_token_above_272k_tokens: 8.25e-05
+      model_info:
+        max_input_tokens: 922000
+        max_output_tokens: 128000
+        max_tokens: 128000
+        mode: responses
+        supports_function_calling: true
+        supports_max_reasoning_effort: true
+        supports_prompt_cache_breakpoint: true
+        supports_prompt_caching: true
+        supports_reasoning: true
+        supports_response_schema: true
+        supports_tool_choice: true
+        supports_vision: true
+        supports_xhigh_reasoning_effort: true
+    - model_name: gpt-6-sol
+      litellm_params:
+        model: bedrock_mantle/openai.gpt-6-sol
+        aws_region_name: us-east-1
+        input_cost_per_token: 2.2e-06
+        output_cost_per_token: 1.1e-05
+        cache_read_input_token_cost: 2.2e-07
+        cache_creation_input_token_cost: 2.75e-06
+        cache_creation_input_token_cost_above_272k_tokens: 5.5e-06
+        cache_read_input_token_cost_above_272k_tokens: 4.4e-07
+        input_cost_per_token_above_272k_tokens: 4.4e-06
+        output_cost_per_token_above_272k_tokens: 1.65e-05
+      model_info:
+        max_input_tokens: 922000
+        max_output_tokens: 128000
+        max_tokens: 128000
+        mode: responses
+        supports_function_calling: true
+        supports_max_reasoning_effort: true
+        supports_none_reasoning_effort: true
+        supports_prompt_cache_breakpoint: true
+        supports_prompt_caching: true
+        supports_reasoning: true
+        supports_response_schema: true
+        supports_tool_choice: true
+        supports_vision: true
+        supports_xhigh_reasoning_effort: true
+    - model_name: gpt-6-luna
+      litellm_params:
+        model: bedrock_mantle/openai.gpt-6-luna
+        aws_region_name: us-east-1
+        input_cost_per_token: 1.1e-07
+        output_cost_per_token: 5.5e-07
+        cache_read_input_token_cost: 1.1e-08
+        cache_creation_input_token_cost: 1.375e-07
+        cache_creation_input_token_cost_above_272k_tokens: 2.75e-07
+        cache_read_input_token_cost_above_272k_tokens: 2.2e-08
+        input_cost_per_token_above_272k_tokens: 2.2e-07
+        output_cost_per_token_above_272k_tokens: 8.25e-07
+      model_info:
+        max_input_tokens: 922000
+        max_output_tokens: 128000
+        max_tokens: 128000
+        mode: responses
+        supports_function_calling: true
+        supports_max_reasoning_effort: true
+        supports_none_reasoning_effort: true
+        supports_prompt_cache_breakpoint: true
+        supports_prompt_caching: true
+        supports_reasoning: true
+        supports_response_schema: true
+        supports_tool_choice: true
+        supports_vision: true
+        supports_xhigh_reasoning_effort: true
+    - model_name: gpt-6.1-sol
+      litellm_params:
+        model: bedrock_mantle/openai.gpt-6.1-sol
+        aws_region_name: us-east-1
+        input_cost_per_token: 2.2e-06
+        output_cost_per_token: 1.1e-05
+        cache_read_input_token_cost: 1.1e-07
+        cache_creation_input_token_cost: 2.75e-06
+        cache_creation_input_token_cost_above_272k_tokens: 5.5e-06
+        cache_read_input_token_cost_above_272k_tokens: 2.2e-07
+        input_cost_per_token_above_272k_tokens: 4.4e-06
+        output_cost_per_token_above_272k_tokens: 1.65e-05
+      model_info:
+        max_input_tokens: 1000000
+        max_output_tokens: 131072
+        max_tokens: 131072
+        mode: responses
+        supports_function_calling: true
+        supports_max_reasoning_effort: true
+        supports_prompt_cache_breakpoint: true
+        supports_prompt_caching: true
+        supports_reasoning: true
+        supports_response_schema: true
+        supports_tool_choice: true
+        supports_vision: true
+        supports_xhigh_reasoning_effort: true
+    - model_name: gpt-6.1-terra
+      litellm_params:
+        model: bedrock_mantle/openai.gpt-6.1-terra
+        aws_region_name: us-east-1
+        input_cost_per_token: 1.1e-06
+        output_cost_per_token: 5.5e-06
+        cache_read_input_token_cost: 5.5e-08
+        cache_creation_input_token_cost: 1.375e-06
+        cache_creation_input_token_cost_above_272k_tokens: 2.75e-06
+        cache_read_input_token_cost_above_272k_tokens: 1.1e-07
+        input_cost_per_token_above_272k_tokens: 2.2e-06
+        output_cost_per_token_above_272k_tokens: 8.25e-06
+      model_info:
+        max_input_tokens: 922000
+        max_output_tokens: 128000
+        mode: responses
+        supports_function_calling: true
+        supports_max_reasoning_effort: true
+        supports_none_reasoning_effort: true
+        supports_prompt_cache_breakpoint: true
+        supports_prompt_caching: true
+        supports_reasoning: true
+        supports_response_schema: true
+        supports_tool_choice: true
+        supports_vision: true
+        supports_xhigh_reasoning_effort: true
+    - model_name: glm-5.3
+      litellm_params:
+        model: bedrock/converse/global.zai.glm-5.3
         aws_region_name: us-west-2
-
-    # ───── Embedding（auto router）─────
-    - model_name: bedrock-embed-v4
+        input_cost_per_token: 1.68e-06
+        output_cost_per_token: 5.28e-06
+        cache_read_input_token_cost: 3.12e-07
+        cache_creation_input_token_cost: 2.1e-06
+        cache_control_injection_points:
+        - role: system
+          location: message
+        - index: -1
+          location: message
+      model_info:
+        max_input_tokens: 1000000
+        max_output_tokens: 128000
+        max_tokens: 128000
+        mode: chat
+        supports_function_calling: true
+        supports_native_structured_output: true
+        supports_prompt_caching: true
+        supports_reasoning: true
+        supports_response_schema: true
+        supports_system_messages: true
+        supports_tool_choice: true
+    - model_name: kimi-k3
+      litellm_params:
+        model: bedrock/converse/global.moonshotai.kimi-k3
+        aws_region_name: us-west-2
+        input_cost_per_token: 3.0e-06
+        output_cost_per_token: 1.5e-05
+        cache_read_input_token_cost: 3.0e-07
+        cache_creation_input_token_cost: 3.75e-06
+      model_info:
+        max_input_tokens: 1000000
+        max_output_tokens: 131072
+        max_tokens: 131072
+        mode: chat
+        supports_function_calling: true
+        supports_reasoning: true
+        supports_response_schema: true
+        supports_system_messages: true
+        supports_tool_choice: true
+        supports_vision: true
+    - model_name: cohere.embed-v4
       litellm_params:
         model: bedrock/global.cohere.embed-v4:0
-
-    # ───── Auto Router 语义路由入口 ─────
-    - model_name: auto
-      litellm_params:
-        model: auto_router/coding_auto_v1
-        auto_router_config_path: /etc/litellm/semantic_router.json
-        auto_router_default_model: claude-haiku-4-5-20251001
-        auto_router_embedding_model: bedrock-embed-v4
-
-    # ───── 通配符兜底 ─────
-    - model_name: bedrock/*
-      litellm_params:
-        model: bedrock/*
         aws_region_name: us-west-2
-
-  router_settings:
-    redis_host: nxdev-valkey-5mrhn9.serverless.usw2.cache.amazonaws.com
-    redis_password: nxdevValkey2026!
-    redis_port: 6379
-    routing_strategy: simple-shuffle
-
-# ── Redis（使用外部 Valkey）─────────────────────────────────────
-redis:
-  enabled: false
-
-# ── 服务 ────────────────────────────────────────────────────────
-service:
-  port: 4000
-  type: ClusterIP
-
-# ── ServiceAccount（EKS Pod Identity，预先创建）─────────────────
-serviceAccount:
-  create: false
-  name: litellm-sa
-
-# ── scaffolding OIDC（内部认证）──────────────────────────────────
-scaffolding:
-  config:
-    auth: oidc://3okkkpoeplqvc65fd2nmrng88t:1o3naif8jv94emj2r3htmvp3e9qvscroj6uaqacnfk9035v6vav2@cognito-idp.us-west-2.amazonaws.com/us-west-2_xSNj224mA?scope=openid%20profile%20email&oidc_logout=false
+        input_cost_per_token: 1.2e-07
+        output_cost_per_token: 0.0
+      model_info:
+        max_input_tokens: 128000
+        max_tokens: 128000
+        mode: embedding
+        supports_embedding_image_input: true

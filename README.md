@@ -1,17 +1,20 @@
 # CloudNativeFormationLitellm.yaml
 
-一份 CloudFormation 模板，一次点击部署完整的 LiteLLM 云原生栈：VPC(IPv6 双栈) + EKS(Auto Mode, 1.35) + EnvoyGateway + CloudFront + Global Accelerator + Cognito SSO + Aurora Postgres Serverless + ElastiCache Serverless(Valkey) + DynamoDB + LiteLLM Helm。已在 `ap-northeast-2` / `ap-southeast-1` 验证通过。
+一份 CloudFormation 模板，一次点击部署完整的 LiteLLM 云原生栈：VPC(IPv6 双栈) + EKS(Auto Mode, 1.35) + EnvoyGateway + CloudFront + Global Accelerator + Cognito SSO + Aurora Postgres Serverless + ElastiCache Serverless(Valkey) + DynamoDB + LiteLLM **v1.106.6**（Helm chart `litellm-helm 1.106.6`）。最近一次在 `us-west-1`（只有 2 个可用区）部署验证通过（2026-10-29），此前在 `ap-northeast-2` / `ap-southeast-1` 验证过。
 
-> 面向运维的纯控制台操作手册（一键部署 / 逐项手动创建、每个 IAM 角色的完整 JSON、一键卸载与逐个卸载）见 [docs/console-deployment.md](docs/console-deployment.md)。
+- **API 文档**（入口、认证、模型、接口、错误码、验证）：[API.md](API.md)
+- **端到端验证脚本**：`LITELLM_KEY=sk-... ./scripts/e2e-test.sh --stack <stack> --region <region>`
+- 面向运维的纯控制台操作手册（一键部署 / 逐项手动创建、每个 IAM 角色的完整 JSON、一键卸载与逐个卸载）见 [docs/console-deployment.md](docs/console-deployment.md)。
+- 不经 CloudFormation、直接装到已有集群的同一套 Helm 配置：[values.yaml](values.yaml)。
 
 ---
 
 ## 前置条件
 
 - AWS 账号 **admin 权限**（模板会创建 IAM Role、VPC、EKS、Lambda、CloudFront 等）
-- **Bedrock 已开通模型访问**（跨区推理走 `global.anthropic.*`，`bedrock-mantle` GPT-OSS 走 `us-east-2`）
+- **Bedrock 已开通模型访问**：Claude opus/sonnet/haiku 5.5、GLM 5.3、Kimi K3、Cohere Embed v4 走本 Region 的 `global.*` 跨区推理配置文件；GPT-6 / GPT-6.1 走 `us-east-1` 的 `bedrock-mantle`（参数 `BedrockRegion` / `BedrockMantleRegion` 可改）
   - 开通位置：AWS Console → Amazon Bedrock → 左侧 **Model access** → **Modify model access** → 勾选 Claude / GPT-OSS 系列 → **Next / Submit**
-- 目标 Region 至少 **3 个 AZ**、EIP 配额 ≥ 3、On-Demand vCPU 配额 ≥ 4、`m8g.xlarge` 可用（模板启动时会预检并直接失败退出）
+- 目标 Region 至少 **2 个 AZ**（2 个 AZ 时第三组子网与第一组同 AZ，见模板 `TwoAzRegion` 条件，目前列入 `us-west-1`）、EIP 配额 ≥ 3、On-Demand vCPU 配额 ≥ 4、`m8g.xlarge` 可用（模板启动时会预检并直接失败退出）
 
 ---
 
@@ -46,8 +49,8 @@
    - **EnvironmentId**: `sg`（1-12 位字母数字，用来给资源加后缀）
    - **VpcCidr**: `10.80.0.0/16`（默认，改成不冲突的 `/16` 即可）
    - **EksVersion**: `1.35`
-   - **AppRootPath**: `/app`
-   - **AdminRoleArn**（可选）: 如果希望某个 IAM Role 自动获得 EKS console 访问权，填它的 ARN；不填也没问题（后面可通过 Access Entry 添加）
+   - **BedrockRegion**: 留空（= Stack 所在 Region）；**BedrockMantleRegion**: `us-east-1`
+   - **AdminRoleArn**（可选）: 如果希望某个 IAM Role 自动获得 EKS console 访问权，填它的 ARN；不填也没问题（后面可通过 Access Entry 添加）。**不要填部署 Stack 所用的身份**：EKS 已自动把集群创建者设为管理员，再建一条同主体的 access entry 会 `409 AlreadyExists` 导致整个 Stack 失败（2026-10-29 实测）
    - **Tags**（可选）: JSON 对象，例如 `{"Env":"prod","Team":"platform"}`
    - 点 **Next**
 6. **Step 3 — Configure stack options**
@@ -70,10 +73,10 @@ Stack 详情页 → **Outputs** 页签，重点看这几项（点右边小图标
 
 | Output Key | 用途 |
 |---|---|
-| `LiteLLMAdminUI` | `https://<cf-domain>/ui/` — 浏览器打开走 Cognito SSO 登录 |
-| `LiteLLMApiServer` | `https://<ga-dns>/` — API 客户端端点（Global Accelerator 双栈） |
+| `LiteLLMAdminUI` | `https://<cf-domain>/ui/` — 浏览器打开走 Cognito SSO 登录；**经 CloudFront 的模型调用一律 403** |
+| `LiteLLMApiServer` | `https://<ga-dns>/` — **唯一**的 API 端点（Global Accelerator 双栈），见 [API.md](API.md) |
 | `CognitoAdminUsername` / `CognitoAdminPassword` | 首次 SSO 登录用，**密码只显示一次，立即保存！** |
-| `LiteLLMMasterKey` | 只读 master key，只能读统计信息，**不能调模型也不能建 key** |
+| `LiteLLMMasterKey` | 只读 master key，只能读统计信息，**不能调模型、不能建 key、不能登录 UI** |
 | `EksClusterName` | 用于 `kubectl` 连接 |
 | `AuroraEndpoint` / `ValkeyEndpoint` / `DynamoDBTableName` | 后端数据服务地址 |
 
@@ -96,7 +99,7 @@ Master key 是只读的（详见"安全模型"），要调模型必须先通过 
      - **Reset Budget**: 选 `monthly`
    - **Create Key**
 7. 弹窗显示 `sk-xxxxx...`，**复制并保存**（只显示一次）
-8. 用这个 key 就可以调 `LiteLLMApiServer` 的 `/v1/chat/completions`、`/v1/models` 等等
+8. 用这个 key 调 `LiteLLMApiServer`（GA）的 `/v1/chat/completions`、`/v1/messages`、`/v1/responses`、`/v1/embeddings` 等，见 [API.md](API.md)。同一个 key 发到 CloudFront 域名会被 403 拒绝
 
 ---
 
@@ -140,7 +143,7 @@ CloudShell 使用你当前登录的 IAM 用户/角色身份。默认这个身份
    - Access scope: `Cluster` → **Add policy**
 6. **Next** → **Create**
 
-（如果部署时 `AdminRoleArn` 已经填了当前身份，模板已经建好 access entry，可以跳过这一步。）
+（如果 CloudShell 身份就是部署 Stack 的身份——EKS 自动给集群创建者建了管理员 access entry——或部署时 `AdminRoleArn` 填的就是它，可以跳过这一步。）
 
 ### 步骤 4：生成 kubeconfig 并连接
 
@@ -220,12 +223,12 @@ kubectl -n litellm exec -it deploy/litellm -- env | grep -E 'PROXY|COGNITO|CLOUD
 - **不要通过 Console `Update stack` 修改 EKS `ComputeConfig` / `NodePools` 字段**：Karpenter Auto Mode 的 NodeClass/NodePool 是通过自定义资源应用的，改这些字段之前先 `kubectl get nodepool` 观察，避免节点池被强制重建。
 - **默认 5 个 NodePool**：`cpu-system`、`cpu` (arm64 通用)、`cpu-large` (arm64 大机型，tainted)、`cpu-general` (x86, tainted)、`gpu` (g6e.2xlarge, tainted)。LiteLLM 只用 arm64 `cpu` 池。
 - **`g6e.2xlarge` 在 ap-southeast-1 不可用**：只影响 GPU pool，LiteLLM 是纯 CPU 部署，不影响生产。
-- **首次部署失败先看 CloudFormation Events 页签**：找 `CREATE_FAILED` 那行的 `Status reason`，90% 的问题是配额 / SCP / IAM 权限、剩下 10% 是 Bedrock 未开通。Custom Resource（`QuotaCheck` / `K8sInfraResources` / `HelmDeploy` 等）失败时同时看对应 Lambda 的 CloudWatch 日志组 `/aws/lambda/<ProjectName><EnvironmentId>-<function>`。
+- **首次部署失败先看 CloudFormation Events 页签**：找 `CREATE_FAILED` 那行的 `Status reason`，90% 的问题是配额 / SCP / IAM 权限、剩下 10% 是 Bedrock 未开通。Custom Resource（`QuotaCheck` / `K8sInfraResources` / `LiteLLMDeploy` 等）失败时同时看对应 Lambda 的 CloudWatch 日志组 `/aws/lambda/<ProjectName><EnvironmentId>-<function>`。
 
 ### 已知 Bedrock 限制（非模板问题）
 
-- `claude-fable-5` 在某些账号下会返回 `data retention mode 'default' is not available for this model` — 是 Bedrock **账号级 data retention 策略**，需在 Bedrock 控制台 → **Settings** → **Model invocation logging / data retention** 里调整。
-- `bedrock-mantle`（GPT-5.4/5.5）目前只在 `us-east-2` 有服务，模板已固定跨区调用。
+- GPT-6 / GPT-6.1 只能走 `bedrock-mantle`（OpenAI Responses API）：bedrock-runtime Converse 会因账号的 data retention 模式拒绝它们。五个 GPT-6 只有 `us-east-1` 的 mantle 全部提供（`us-west-2` 只有 `gpt-6-astra`），所以 `BedrockMantleRegion` 默认 `us-east-1`。
+- `kimi-k3` 在 Bedrock 上不支持提示缓存（Converse 拒绝 `cachePoint`），模板里它没有缓存注入点。
 
 ### 拆栈
 
@@ -240,24 +243,27 @@ kubectl -n litellm exec -it deploy/litellm -- env | grep -E 'PROXY|COGNITO|CLOUD
 
 ## 五、安全模型
 
-**Master key 是只读的**，通过 LiteLLM `custom_auth` hook 硬编码限制：
+**只能用虚拟 key 调模型**，与 base 的 LiteLLM（`base/templates/labs/litellm.yaml`）同一套做法：
 
-- ✅ 可调 `/models`、`/spend/*`、`/global/spend`、`/*/info` 等只读路径
-- ❌ `/v1/chat/completions` → 403（不能调模型）
-- ❌ `/key/generate` → 403（不能建 key）
+- **Master key 只读**：`access_policy.py`（逐字复制自 `base/scripts/litellm/access_policy.py`）包装 LiteLLM 所有 HTTP / WebSocket / MCP 入口共用的认证函数：
+  - ✅ `GET` 统计 / 信息类接口（`/model/info`、`/key/info`、`/spend/*`、`/global/*` …）
+  - ❌ 所有模型调用（`/v1/chat/completions`、`/v1/messages`、`/bedrock/*` 透传 …）→ 403
+  - ❌ 所有写操作（`/key/generate`、`/user/new`、`/model/new` …）→ 403
+  - ❌ 不能当 UI 密码登录（`disable_env_credential_login: true`），UI 只能走 Cognito SSO
+- **每个 key 必须带预算**（`key_generation_settings`），花费按 key / 团队统计；Spend Log 不保存提示词与回复（`store_prompts_in_spend_logs: false`）。
+- **API 只走 GA，不走 CloudFront**：Envoy 在两条 HTTPRoute 上给请求打 `X-LiteLLM-Edge` 头（`set`，无法伪造），`edge_policy.py` 用 LiteLLM 自己的 `RouteChecks.is_llm_api_route` 判断，凡是经 CloudFront 的模型调用（含 `/chat/completions` 等别名、透传、MCP）一律 403；UI、SSO、管理接口和 `GET /v1/models` 不受影响。
+- **模型列表**写死在模板 `LiteLLMDeploy.Properties.LiteLLMValues` 里（`store_model_in_db: false`，无 `bedrock/*` 通配），与 `litellm-model-discovery` 给 base 选出的 11 个 Bedrock 模型相同：Claude opus/sonnet/haiku 5.5、GPT-6 astra/sol/luna、GPT-6.1 sol/terra、GLM 5.3、Kimi K3、Cohere Embed v4。
 
-调模型和建 key 必须用 **SSO 登录后在 UI 里生成的虚拟 key**。这个设计让 master key 可以放在 CloudFormation Outputs 里，即使泄漏也无法造成损失。
-
-**模型列表**内置在模板里（`LiteLLMDeploy` 资源），部署时通过 Helm `--set` 注入。当前包含：Claude Sonnet 5 / Opus 4.8 / Fable 5、Claude 4.5-4.6 全家族、GPT-5.4 / 5.5（走 `bedrock-mantle` 固定 us-east-2）。
+master key 仍然需要存在（它给 SSO 的 UI 会话 JWT 签名），由 StackId 的 GUID 派生，每个 Stack 不同；因为只读，可以放在 Outputs 里。两个策略模块依赖 LiteLLM 内部函数，升级镜像后跑一遍 `scripts/e2e-test.sh`。
 
 ---
 
 ## 六、架构速记
 
-- **入口两条路**：
-  - CloudFront (`.cloudfront.net`) → 内部 ALB → EnvoyGateway → LiteLLM（浏览器 UI 走这条，SSO 回调也走这条）
-  - Global Accelerator (`.awsglobalaccelerator.com`) → 内部 NLB → EnvoyGateway → LiteLLM（API 客户端走这条）
-- **认证**：Cognito User Pool → EnvoyGateway `SecurityPolicy` (OIDC) 拦截 `/apis/v1/` 前缀；UI 走 LiteLLM 自己的 SSO
+- **入口两条路，全链路没有公网负载均衡器**（NLB、ALB 都是 `internal`）：
+  - CloudFront (`.cloudfront.net`) → VPC Origin → 内部 ALB → EnvoyGateway → LiteLLM（浏览器 UI 与 SSO 回调；模型调用 403）
+  - Global Accelerator (`.awsglobalaccelerator.com`) → 内部 NLB → EnvoyGateway → LiteLLM（API 客户端，唯一的模型调用入口）
+- **认证**：UI 走 LiteLLM 的 Cognito SSO（Cognito 组 `admin` → `proxy_admin`）；API 用 UI 里创建的虚拟 key
 - **存储**：Aurora Postgres（LiteLLM key/spend 元数据）、Valkey（rate limit）、DynamoDB（会话消息）、EFS（可选共享卷）
 - **计算**：EKS Auto Mode + Karpenter，纯 arm64 (m8g) 节点，1 min 弹性
 - **TLS**：cert-manager + Let's Encrypt（`ClusterIssuer: letsencrypt-gateway`），Gateway 上双证书（GA hostname + Envoy 默认 hostname）

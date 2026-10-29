@@ -20,9 +20,8 @@
 在开始任意一条路线之前，先逐项确认：
 
 1. **权限**：部署者是 `AdministratorAccess`（或同等的 PowerUser + IAM 全权限）。模板/手动流程都会创建 IAM Role、VPC、EKS、Lambda、CloudFront、Global Accelerator。
-2. **Region**：只能选下列 Region 之一。模板里 `BedrockConfig` 映射表只列了这 7 个，其它 Region 会在创建时报 `Unable to get mapping for BedrockConfig::<region>` 并直接失败：
-   `us-east-1`、`us-west-2`、`ap-southeast-1`、`ap-northeast-1`、`ap-northeast-3`、`eu-west-1`、`eu-central-1`
-3. **Bedrock 模型访问**：控制台 → **Amazon Bedrock** → 左侧 **Model access** → **Modify model access** → 勾选 Anthropic Claude 系列、OpenAI GPT-OSS 系列 → **Next** → **Submit**。
+2. **Region**：任意提供 EKS Auto Mode、Aurora Serverless v2、ElastiCache Serverless、CloudFront VPC Origin 的 Region。只有 2 个可用区的 Region（`us-west-1`，已验证）也可以：模板的 `TwoAzRegion` 条件会把第三组子网放进第一个可用区，Valkey 只用两个子网。Bedrock 调用默认在本 Region（参数 `BedrockRegion`，走 `global.*` 跨区推理配置文件），GPT-6 固定走 `us-east-1` 的 bedrock-mantle（参数 `BedrockMantleRegion`）。
+3. **Bedrock 模型访问**：控制台 → **Amazon Bedrock** → 左侧 **Model access** → 确认 Anthropic Claude（opus/sonnet/haiku 5.5）、OpenAI GPT-6 / GPT-6.1、Z.AI GLM 5.3、Moonshot Kimi K3、Cohere Embed v4 可用 → 如未开通，**Modify model access** → 勾选 → **Next** → **Submit**。
 4. **配额**（控制台 → **Service Quotas** → **AWS services**）：
 
    | 服务 | 配额名称 | 代码 | 至少需要 |
@@ -70,9 +69,10 @@
 | EnvironmentId | `sg` | 1–12 位字母数字。**必须全小写**：它会拼进 Cognito 域名前缀 `cnf-<EnvironmentId>-<账号ID>`，Cognito 域名不允许大写 |
 | VpcCidr | `10.80.0.0/16` | 必须是 `/16`，且不能和已有 VPC / 对等网络冲突 |
 | EksVersion | `1.35` | 可选 1.33 / 1.34 / 1.35 |
-| EnvoyGatewayVersion | `v1.7.1` | 保持默认 |
-| AppRootPath | `/app` | 保持默认 |
-| AdminRoleArn | 你平时登录控制台所用 IAM Role 的 ARN | 可留空。填了之后这个角色自动成为 EKS 集群管理员，省掉 3.3 节的授权步骤 |
+| EnvoyGatewayVersion | `v1.8.0` | 保持默认 |
+| BedrockRegion | 留空 | Bedrock 运行时 Region，留空 = Stack 所在 Region |
+| BedrockMantleRegion | `us-east-1` | GPT-6 走的 bedrock-mantle Region，只有 `us-east-1` 五个 GPT-6 都有 |
+| AdminRoleArn | 你平时登录控制台所用 IAM Role 的 ARN | 可留空。填了之后这个角色自动成为 EKS 集群管理员，省掉 3.3 节的授权步骤。**不要填部署 Stack 所用的身份**（它已自动是集群管理员，重复的 access entry 会 409 失败） |
 | Tags | `{"CostCenter":"AI-Platform","Owner":"me@example.com"}` | JSON 对象，没有强制标签就保持 `{}` |
 
 > **ProjectName + EnvironmentId 决定了几乎所有资源名**，例如 EKS 集群名 `litellmsg`、RDS 集群 `litellmsg-pg`、IAM 角色 `litellmsg-EKSClusterRole`。同一账号同一 Region 里这一组合必须唯一，模板第一步的预检会检查冲突。
@@ -118,8 +118,8 @@ Stack 详情页 → **Outputs** 页签：
 
 | Output | 用途 |
 |---|---|
-| `LiteLLMAdminUI` | `https://<xxx>.cloudfront.net/ui/`，浏览器打开，走 Cognito SSO |
-| `LiteLLMApiServer` | `https://<xxx>.awsglobalaccelerator.com/`，API 客户端端点 |
+| `LiteLLMAdminUI` | `https://<xxx>.cloudfront.net/ui/`，浏览器打开，走 Cognito SSO。**经 CloudFront 的模型调用一律 403** |
+| `LiteLLMApiServer` | `https://<xxx>.awsglobalaccelerator.com/`，**唯一**提供模型调用的端点（API 文档见 [../API.md](../API.md)） |
 | `CognitoAdminUsername` / `CognitoAdminPassword` | 首次 SSO 登录账号（默认 `admin@example.aws`）。**密码请立即保存** |
 | `LiteLLMMasterKey` | 只读 master key：只能查统计，不能调模型、不能建 key |
 | `EksClusterName` | kubectl 连接用 |
@@ -136,7 +136,7 @@ Stack 详情页 → **Outputs** 页签：
    - **Models**：留空表示全部模型
    - 展开 **Optional Settings**：**Max Budget (USD)** 填如 `100`，**Reset Budget** 选 `monthly`
    - **Create Key**
-4. 复制弹窗中的 `sk-...`（只显示一次），即可调用 `LiteLLMApiServer` 的 `/v1/chat/completions`、`/v1/models`
+4. 复制弹窗中的 `sk-...`（只显示一次），即可调用 `LiteLLMApiServer` 的 `/v1/chat/completions`、`/v1/messages` 等（见 [../API.md](../API.md)）。同一个 key 发到 CloudFront 域名会被 403 拒绝
 
 ### 1.6 连接集群
 
@@ -389,7 +389,7 @@ LiteLLM Pod 通过 EKS Pod Identity 获得这个角色的临时凭证，**不需
 |---|---|
 | `STSCallerIdentity` | 排障时在 Pod 里确认拿到的是哪个角色 |
 | `BedrockInvoke` | 调用 Claude 等模型（含跨区推理配置文件 `global.anthropic.*`） |
-| `BedrockMantleInference` | GPT-5.x 走 OpenAI 兼容的 `bedrock-mantle` 端点，它是**独立的 IAM 服务前缀**，授权动作是 `bedrock-mantle:CreateInference` 而不是 `bedrock:InvokeModel`；漏掉这一段，GPT 模型会返回 403 |
+| `BedrockMantleInference` | GPT-6 / GPT-6.1 走 OpenAI 兼容的 `bedrock-mantle` 端点，它是**独立的 IAM 服务前缀**，授权动作是 `bedrock-mantle:CreateInference` 而不是 `bedrock:InvokeModel`；漏掉这一段，GPT 模型会返回 403 |
 | `IAMRoleRead` | 只读自己这个角色，用于自检；范围限定到本角色 ARN |
 | `DynamoDBSessionTable` | 读写会话表；范围限定到 `litellm-sg-sessions` 开头的表 |
 
@@ -647,7 +647,7 @@ kubectl version --client
 **AWS 控制台的 IAM 权限不等于 EKS 集群权限**，集群内权限由 EKS Access Entry 单独授予。以下情况可以跳过本步：
 
 - 手动路线中创建集群时选了 **Bootstrap cluster administrator access: Allow**，且现在用的是同一个身份
-- 一键部署时 `AdminRoleArn` 填的就是当前身份
+- 当前身份就是部署 Stack 的身份（EKS 自动授予集群创建者管理员），或一键部署时 `AdminRoleArn` 填的就是它
 
 否则：
 

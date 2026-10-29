@@ -1,9 +1,13 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  CloudNativeFormation - One-click cloud-native infrastructure stack.
-  Creates VPC(IPv6), EKS(Auto Mode), EnvoyGateway, Cognito OIDC,
-  CloudFront, Global Accelerator, IRSA test pod.
-  Region: ap-northeast-2 validated. Upload this single file to deploy.
+  CloudNativeFormation LiteLLM - one-click LiteLLM v1.106.6 stack.
+  VPC (IPv6 dual-stack), EKS (Auto Mode), EnvoyGateway behind an internal NLB
+  (Global Accelerator, API) and an internal ALB (CloudFront VPC Origin, admin UI);
+  no load balancer has a public IP. Cognito SSO, Aurora PostgreSQL Serverless v2,
+  ElastiCache Serverless (Valkey), DynamoDB, EFS. Models: Bedrock Claude 5.5 /
+  GPT-6 / GLM / Kimi / Cohere embed, virtual keys only (read-only master key),
+  no model calls through CloudFront. Validated in us-west-1 (2 AZs).
+  Upload this single file to S3 and deploy.
 
 # ==============================================================================
 # METADATA - Console parameter grouping
@@ -29,9 +33,10 @@ Metadata:
         Parameters:
           - EnvoyGatewayVersion
       - Label:
-          default: "App Settings"
+          default: "Bedrock"
         Parameters:
-          - AppRootPath
+          - BedrockRegion
+          - BedrockMantleRegion
       - Label:
           default: "Resource Tags"
         Parameters:
@@ -47,8 +52,10 @@ Metadata:
         default: "Kubernetes Version"
       EnvoyGatewayVersion:
         default: "EnvoyGateway Version"
-      AppRootPath:
-        default: "App Root Path"
+      BedrockRegion:
+        default: "Bedrock runtime region (empty = this region)"
+      BedrockMantleRegion:
+        default: "bedrock-mantle region (GPT-6)"
       Tags:
         default: "Resource Tags (JSON)"
 
@@ -81,14 +88,29 @@ Parameters:
   EnvoyGatewayVersion:
     Type: String
     Description: "EnvoyGateway release version"
-    Default: "v1.7.1"
-  AppRootPath:
+    Default: "v1.8.0"
+  BedrockRegion:
     Type: String
-    Description: "Root path for the scaffolding app (e.g. /app)"
-    Default: "/app"
+    Description: >-
+      Region of the Bedrock runtime calls (Claude, GLM, Kimi, Cohere embed, all
+      through global.* cross-region inference profiles). Empty = the stack region.
+    Default: ""
+    AllowedPattern: '^([a-z]{2}(-[a-z]+)+-[0-9])?$'
+  BedrockMantleRegion:
+    Type: String
+    Description: >-
+      Region of bedrock-mantle (OpenAI Responses API) for the GPT-6 models.
+      us-east-1 serves all five (gpt-6-astra/sol/luna, gpt-6.1-sol/terra); most
+      other regions serve a subset or none.
+    Default: "us-east-1"
+    AllowedPattern: '^[a-z]{2}(-[a-z]+)+-[0-9]$'
   AdminRoleArn:
     Type: String
-    Description: "IAM Role ARN for EKS console admin access (e.g. arn:aws:iam::123456789012:role/admin)"
+    Description: >-
+      IAM Role ARN that gets EKS cluster-admin access (e.g. arn:aws:iam::123456789012:role/admin).
+      Leave EMPTY for the identity that deploys the stack: EKS already makes the
+      cluster creator an admin, and a second access entry for it fails with 409
+      AlreadyExists.
     Default: ""
   Tags:
     Type: String
@@ -96,26 +118,17 @@ Parameters:
     Default: "{}"
 Conditions:
   HasAdminRole: !Not [!Equals [!Ref AdminRoleArn, ""]]
+  BedrockInStackRegion: !Equals [!Ref BedrockRegion, ""]
+  # Regions with only two AZs for (almost) every account. QuotaCheck then returns
+  # AZ3 = AZ1, so the "C" subnets share AZ1 with "A": fine for EKS, Aurora, EFS
+  # (mount targets are deduplicated by AZ) and the load balancers (one subnet per
+  # AZ), but ElastiCache Serverless wants subnets in distinct AZs -> A + B only.
+  TwoAzRegion: !Equals [!Ref "AWS::Region", "us-west-1"]
 
 # ==============================================================================
 # MAPPINGS
 # ==============================================================================
 Mappings:
-  BedrockConfig:
-    us-west-2:
-      WildcardRegion: us-west-2
-    us-east-1:
-      WildcardRegion: us-east-1
-    ap-southeast-1:
-      WildcardRegion: us-west-2
-    ap-northeast-1:
-      WildcardRegion: us-west-2
-    ap-northeast-3:
-      WildcardRegion: us-west-2
-    eu-west-1:
-      WildcardRegion: us-west-2
-    eu-central-1:
-      WildcardRegion: us-west-2
   SubnetConfig:
     PublicA:
       CidrSuffix: "0.0/20"
@@ -959,9 +972,9 @@ Resources:
                   - bedrock:GetInferenceProfile
                 Resource: "*"
               # bedrock-mantle is a separate IAM service prefix from bedrock.
-              # GPT-5.4/5.5 are only served via the OpenAI-compatible
-              # bedrock-mantle endpoint, whose inference call is authorized by
-              # bedrock-mantle:CreateInference (not bedrock:InvokeModel).
+              # GPT-6 / GPT-6.1 are only served through the OpenAI-compatible
+              # bedrock-mantle endpoint (Responses API), whose inference call is
+              # authorized by bedrock-mantle:CreateInference, not bedrock:InvokeModel.
               - Sid: BedrockMantleInference
                 Effect: Allow
                 Action:
@@ -1190,10 +1203,11 @@ Resources:
       MajorEngineVersion: "8"
       SecurityGroupIds:
         - !Ref DataServicesSG
-      SubnetIds:
-        - !Ref PrivateSubnetA
-        - !Ref PrivateSubnetB
-        - !Ref PrivateSubnetC
+      # Distinct AZs only (see Conditions.TwoAzRegion).
+      SubnetIds: !If
+        - TwoAzRegion
+        - [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        - [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
       UserGroupId: !Ref ValkeyUserGroup
       Tags:
         - Key: Name
@@ -1244,9 +1258,11 @@ Resources:
       DatabaseName: litellm
       MasterUsername: pgadmin
       MasterUserPassword: !Sub "${ProjectName}${EnvironmentId}Pg2026!"
+      # MaxCapacity 8 ACU: max_connections scales with it (2 ACU ~ 200, too few
+      # for LiteLLM at maxReplicas); billed only while the load needs it.
       ServerlessV2ScalingConfiguration:
         MinCapacity: 0.5
-        MaxCapacity: 2
+        MaxCapacity: 8
       DBSubnetGroupName: !Ref AuroraSubnetGroup
       VpcSecurityGroupIds:
         - !Ref DataServicesSG
@@ -1978,41 +1994,11 @@ Resources:
       ManagedLoginVersion: 2
       UserPoolId: !Ref CognitoUserPool
 
-  CognitoUserPoolClient:
-    Type: AWS::Cognito::UserPoolClient
-    DependsOn: CognitoUserPoolDomain
-    Properties:
-      ClientName: !Sub "${ProjectName}${EnvironmentId}-app"
-      UserPoolId: !Ref CognitoUserPool
-      GenerateSecret: true
-      ExplicitAuthFlows:
-        - ALLOW_USER_AUTH
-        - ALLOW_USER_SRP_AUTH
-        - ALLOW_REFRESH_TOKEN_AUTH
-      AllowedOAuthFlows:
-        - code
-      AllowedOAuthFlowsUserPoolClient: true
-      AllowedOAuthScopes:
-        - openid
-        - profile
-        - email
-        - phone
-      SupportedIdentityProviders:
-        - COGNITO
-      CallbackURLs:
-        - !Sub "https://${CloudFrontDistribution.DomainName}${AppRootPath}/auth/oidc/callback"
-      LogoutURLs:
-        - !Sub "https://${CloudFrontDistribution.DomainName}${AppRootPath}/auth/oidc/logout"
-
-  CognitoManagedLoginBranding:
-    Type: AWS::Cognito::ManagedLoginBranding
-    Properties:
-      UserPoolId: !Ref CognitoUserPool
-      ClientId: !Ref CognitoUserPoolClient
-      UseCognitoProvidedValues: true
-
-
-  # --- LiteLLM Cognito App Client (separate SSO client) ---
+  # --- LiteLLM Cognito App Client (the admin UI's SSO) ---
+  # LiteLLM's generic OIDC SSO: /sso/key/generate -> Cognito -> /sso/callback on
+  # PROXY_BASE_URL (CloudFront), so a UI opened on GA signs in on CloudFront;
+  # the GA URLs stay registered for a PROXY_BASE_URL moved to GA. Users in the
+  # Cognito group `admin` become proxy_admin.
   LiteLLMCognitoClient:
     Type: AWS::Cognito::UserPoolClient
     DependsOn: CognitoUserPoolDomain
@@ -2045,6 +2031,7 @@ Resources:
       UserPoolId: !Ref CognitoUserPool
       ClientId: !Ref LiteLLMCognitoClient
       UseCognitoProvidedValues: true
+
   # Pre Token Generation Lambda: maps cognito:groups → groups claim in JWT
   CognitoPreTokenGenFunction:
     Type: AWS::Lambda::Function
@@ -2376,8 +2363,12 @@ Resources:
                       maxUnavailable: 0
                       maxSurge: 1
                 envoyHpa:
-                  minReplicas: 1
+                  # 2: one Envoy per AZ-ish, a rollout or node loss never leaves
+                  # the gateway without a ready proxy.
+                  minReplicas: 2
                   maxReplicas: 500
+                  # CPU only: a proxy's memory is a near-constant baseline, so a
+                  # memory target would pin the HPA at maxReplicas.
                   metrics:
                     - type: Resource
                       resource:
@@ -2385,12 +2376,6 @@ Resources:
                         target:
                           type: Utilization
                           averageUtilization: 60
-                    - type: Resource
-                      resource:
-                        name: memory
-                        target:
-                          type: AverageValue
-                          averageValue: "400Mi"
                   behavior:
                     scaleUp:
                       stabilizationWindowSeconds: 30
@@ -2427,8 +2412,10 @@ Resources:
           metadata:
             name: eg
             namespace: envoy-gateway-system
-            annotations:
-              cert-manager.io/cluster-issuer: letsencrypt-gateway
+            # NOTE: no cert-manager.io/cluster-issuer annotation (gateway-shim):
+            # the listeners have no hostname, so the shim has nothing to issue,
+            # and a shim-managed Secret would fight the explicit ga-cert
+            # Certificate (GAHttpsSetup). Same as CloudFormation/CloudNativeFormation.yaml.
           spec:
             gatewayClassName: !Sub "cnf-${EnvironmentId}-eg"
             infrastructure:
@@ -2454,8 +2441,6 @@ Resources:
                   certificateRefs:
                     - kind: Secret
                       name: ga-https-cert
-                    - kind: Secret
-                      name: eg-https-cert
         # --- StorageClass (EFS with uid/gid 1000) ---
         - apiVersion: storage.k8s.io/v1
           kind: StorageClass
@@ -2840,21 +2825,34 @@ Resources:
       IngressName: cf-vpc-origin
       Region: !Ref "AWS::Region"
 
-  # SPA Cache Policies
+  # --- CloudFront cache policies (CloudFront serves the admin UI only) ---
+  # Same split as CloudFormation/CloudNativeFormation.yaml (long-lived static
+  # assets, short-lived HTML, everything else uncached), adapted to LiteLLM's UI
+  # (a Next.js static export under /ui/) and with the Host header in every cache
+  # key: one cache entry per domain, never a page cached for one hostname served
+  # to another. A Host in the cache key is also always forwarded to the origin,
+  # which Envoy needs to pick HTTPRoute litellm-cf.
+  #   static: /ui/_next/static/* — content-hashed file names, immutable; at least
+  #     1 day even though LiteLLM sends no Cache-Control.
+  #   html: /ui, /ui/* — the UI pages; 5 min by default so an upgrade shows up
+  #     quickly, honouring origin Cache-Control (MinTTL 0).
+  # API routes use the managed CachingDisabled policy (CacheBehaviors below).
   CachePolicyStaticAssets:
     Type: AWS::CloudFront::CachePolicy
     DependsOn: QuotaCheck
     Properties:
       CachePolicyConfig:
-        Name: !Sub "${ProjectName}${EnvironmentId}-static-30d"
+        Name: !Sub "${ProjectName}${EnvironmentId}-ui-static"
+        Comment: "LiteLLM UI hashed assets; Host in cache key"
         DefaultTTL: 2592000
-        MaxTTL: 2592000
-        MinTTL: 2592000
+        MaxTTL: 31536000
+        MinTTL: 86400
         ParametersInCacheKeyAndForwardedToOrigin:
           EnableAcceptEncodingGzip: true
           EnableAcceptEncodingBrotli: true
           HeadersConfig:
-            HeaderBehavior: none
+            HeaderBehavior: whitelist
+            Headers: [Host]
           CookiesConfig:
             CookieBehavior: none
           QueryStringsConfig:
@@ -2865,15 +2863,17 @@ Resources:
     DependsOn: QuotaCheck
     Properties:
       CachePolicyConfig:
-        Name: !Sub "${ProjectName}${EnvironmentId}-html-1h"
-        DefaultTTL: 3600
+        Name: !Sub "${ProjectName}${EnvironmentId}-ui-html"
+        Comment: "LiteLLM UI pages; Host in cache key"
+        DefaultTTL: 300
         MaxTTL: 3600
-        MinTTL: 3600
+        MinTTL: 0
         ParametersInCacheKeyAndForwardedToOrigin:
           EnableAcceptEncodingGzip: true
           EnableAcceptEncodingBrotli: true
           HeadersConfig:
-            HeaderBehavior: none
+            HeaderBehavior: whitelist
+            Headers: [Host]
           CookiesConfig:
             CookieBehavior: none
           QueryStringsConfig:
@@ -3028,6 +3028,13 @@ Resources:
             OriginCustomHeaders:
               - HeaderName: X-CloudFront-Secret
                 HeaderValue: !Sub "cnf-${EnvironmentId}-${AWS::AccountId}"
+        # Uncached unless listed: the default behaviour and every API prefix use
+        # the managed CachingDisabled policy (4135ea2d...) with all viewer headers,
+        # cookies and query strings forwarded (AllViewer, 216adef6...). The API
+        # prefixes are listed explicitly so a later change of the default cannot
+        # start caching them. Model calls through CloudFront are 403 anyway
+        # (edge_policy.py); the rest is the UI's management API, per-user data.
+        # First match wins: the cached UI patterns come first.
         DefaultCacheBehavior:
           TargetOriginId: EnvoyGatewayNLB
           ViewerProtocolPolicy: redirect-to-https
@@ -3038,13 +3045,13 @@ Resources:
           ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
           Compress: true
         CacheBehaviors:
-          - PathPattern: "/assets/*"
+          - PathPattern: "/ui/_next/static/*"
             TargetOriginId: EnvoyGatewayNLB
             ViewerProtocolPolicy: redirect-to-https
             AllowedMethods: [GET, HEAD]
             CachedMethods: [GET, HEAD]
             CachePolicyId: !Ref CachePolicyStaticAssets
-            OriginRequestPolicyId: "bf0718e1-ba1e-49d1-88b1-f726733018ae"
+            OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
             ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
             Compress: true
           - PathPattern: "/ui"
@@ -3065,7 +3072,25 @@ Resources:
             OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
             ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
             Compress: true
-          - PathPattern: "/auth/*"
+          - PathPattern: "/v1/*"
+            TargetOriginId: EnvoyGatewayNLB
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+            OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            Compress: true
+          - PathPattern: "/v2/*"
+            TargetOriginId: EnvoyGatewayNLB
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+            OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            Compress: true
+          - PathPattern: "/chat/*"
             TargetOriginId: EnvoyGatewayNLB
             ViewerProtocolPolicy: redirect-to-https
             AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
@@ -3083,7 +3108,79 @@ Resources:
             OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
             ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
             Compress: true
-          - PathPattern: "/auth/oidc/*"
+          - PathPattern: "/key/*"
+            TargetOriginId: EnvoyGatewayNLB
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+            OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            Compress: true
+          - PathPattern: "/user/*"
+            TargetOriginId: EnvoyGatewayNLB
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+            OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            Compress: true
+          - PathPattern: "/team/*"
+            TargetOriginId: EnvoyGatewayNLB
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+            OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            Compress: true
+          - PathPattern: "/model/*"
+            TargetOriginId: EnvoyGatewayNLB
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+            OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            Compress: true
+          - PathPattern: "/spend/*"
+            TargetOriginId: EnvoyGatewayNLB
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+            OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            Compress: true
+          - PathPattern: "/global/*"
+            TargetOriginId: EnvoyGatewayNLB
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+            OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            Compress: true
+          - PathPattern: "/health*"
+            TargetOriginId: EnvoyGatewayNLB
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+            OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            Compress: true
+          - PathPattern: "/.well-known/*"
+            TargetOriginId: EnvoyGatewayNLB
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+            OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            Compress: true
+          - PathPattern: "/litellm/*"
             TargetOriginId: EnvoyGatewayNLB
             ViewerProtocolPolicy: redirect-to-https
             AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
@@ -3218,11 +3315,11 @@ Resources:
         # key (sk-litellm-proxy-master-key) — anyone could use it. We instead
         # derive a strong random key from the CloudFormation StackId GUID (unique
         # per deployment, not in source), and — critically — restrict what the
-        # master key may DO via the custom_auth hook below: it becomes read-only
+        # master key may DO via access_policy.py below: it becomes read-only
         # (usage/stats), and CANNOT call models or create/modify keys. Those
-        # operations require an SSO-issued admin virtual key. We point the chart
-        # at this Secret via masterkeySecretName (see LiteLLMDeploy HelmSets),
-        # which also suppresses the chart's own random-key Secret.
+        # need a virtual key (SSO UI session key, or one created in the UI). The
+        # chart reads this Secret via masterkeySecretName (LiteLLMDeploy), which
+        # also suppresses the chart's own random-key Secret.
         - apiVersion: v1
           kind: Secret
           metadata:
@@ -3235,72 +3332,277 @@ Resources:
             masterkey: !Sub
               - "sk-cnf-${Guid}"
               - Guid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
-        # --- LiteLLM custom_auth module (master key = read-only) ---
-        # Mounted into the proxy at /etc/litellm/ (LiteLLM resolves custom_auth
-        # module paths relative to the config file dir). In auto mode the
-        # enterprise custom-auth wrapper falls back to LiteLLM's built-in auth
-        # whenever this hook raises a non-ProxyException, so we only OWN the
-        # master-key deny decision and defer everything else unchanged.
+        # --- LiteLLM policy callbacks (litellm_settings.callbacks) ---
+        # Mounted next to config.yaml (/etc/litellm/), where LiteLLM resolves
+        # callback modules; imported while config.yaml is read, so the pod does
+        # not start if either fails to patch the pinned image's internals.
+        #   access_policy.py — VERBATIM copy of base/scripts/litellm/access_policy.py
+        #     (keep in sync, re-test on every image tag): the master key is
+        #     read-only (GET statistics + UI login; model calls and writes such as
+        #     /key/generate -> 403), so every model call goes through a virtual
+        #     key and is attributed to it; GET /v1/models is public. Its
+        #     *.svc.cluster.local URL allowance is inert here
+        #     (no litellm_settings.user_url_allowed_hosts).
+        #   edge_policy.py — no model call through CloudFront: any LLM route of a
+        #     request stamped X-LiteLLM-Edge: cloudfront (HTTPRoute litellm-cf
+        #     below) or carrying CloudFront's X-CloudFront-Secret -> 403.
         - apiVersion: v1
           kind: ConfigMap
           metadata:
-            name: litellm-custom-auth
+            name: litellm-policy
             namespace: litellm
           data:
-            litellm_master_key_readonly.py: |
-              """custom_auth: make the LiteLLM master key read-only.
+            access_policy.py: |
+              """Access policy of the base LiteLLM: a read-only master key, a public model list.
 
-              The master key must exist (it signs the SSO UI-session JWT) but must
-              NOT be usable to call models or create/modify/delete API keys. It
-              keeps read & statistics access. Any other credential (SSO admin
-              virtual key, normal virtual key, JWT) defers to built-in auth.
+              1. The model list is public. GET /v1/models and GET /models (the OpenAI listing:
+                 names only) answer without any credential, so clients and tools can discover
+                 what to call before they hold a key. LiteLLM's own `general_settings.public_routes`
+                 is an Enterprise feature (ignored unless premium_user), so this module extends
+                 the check both auth stages call, `route_in_additonal_public_routes`, instead.
+                 /v1/models/{id}, /model/info and everything else still need a key.
+
+              2. The master key is read-only.
+
+              Why: a request authenticated with the master key is attributed to the built-in
+              `litellm_proxy_master_key` alias, not to a virtual key, so its spend is not tied
+              to any key / team / budget — usage through it is invisible in the per-key
+              statistics. Every model call must therefore go through a virtual key created in
+              the admin UI, and the master key keeps only:
+
+                - UI login (POST /login, /v2/login are public routes; the UI then works with
+                  the short-lived session key that login mints, which this guard does not touch);
+                - read-only GET/HEAD on management and statistics routes (/spend/*, /key/info,
+                  /model/info, /global/*, /health, ...).
+
+              Denied for the master key, with 403: every LLM / pass-through route (chat,
+              embeddings, images, audio, responses, /bedrock/*, realtime, ...) regardless of
+              method, and every non-GET management call — /key/generate, /key/regenerate,
+              /key/update, /user/new, /model/new, ... — i.e. it can no longer mint keys.
+
+              How: LiteLLM has no per-route policy for the master key, and custom_auth would
+              replace its whole auth chain. Instead this module wraps the internal auth
+              builder that every HTTP, WebSocket and MCP entry point funnels through, and
+              checks its *result*: a master-key login is the only identity whose api_key is
+              the master-key alias, whichever header carried the key.
+
+              3. In-cluster media URLs. LiteLLM's SSRF guard refuses user-supplied URLs
+                 (image_url, audio/file URLs) that resolve to a private address, which every
+                 *.svc.cluster.local Service does. `litellm_settings.user_url_allowed_hosts`
+                 lifts that per host, but only by exact `host` / `host:port`. This module adds
+                 a suffix form: an entry `*.svc.cluster.local` allows any host ending in
+                 `.svc.cluster.local` (any port). Exact entries keep LiteLLM's meaning, and a
+                 matched host is still resolved and pinned to its IP — only the private-range
+                 check is skipped.
+
+              Loaded through litellm_settings.callbacks (imported while config.yaml is read,
+              before the first request). Coupled to the pinned image (litellm.image.tag): the
+              import fails loudly — the pod does not start — if those internals move.
               """
-              import os
-              from fastapi import Request
-              from litellm.proxy._types import LiteLLMRoutes, ProxyException
-              from litellm.proxy.auth.auth_utils import get_request_route
+
+              import litellm
+              from litellm._logging import verbose_proxy_logger
+              from litellm.litellm_core_utils import url_utils as _url_utils
+              from litellm.constants import LITELLM_PROXY_MASTER_KEY_ALIAS
+              from litellm.integrations.custom_logger import CustomLogger
+              from litellm.proxy._types import ProxyException
+              from litellm.proxy.auth import user_api_key_auth as _auth
+              from litellm.proxy.auth.route_checks import RouteChecks
+
+              _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+              PUBLIC_ROUTES = frozenset({"/v1/models", "/models"})
 
 
-              class _Fallback(Exception):
-                  """Hand control back to LiteLLM's built-in auth (auto mode)."""
+              def _deny(route: str, why: str) -> ProxyException:
+                  return ProxyException(
+                      message=f"master key is read-only: {why} ({route}). Use a virtual key created in the admin UI.",
+                      type="auth_error",
+                      param="api_key",
+                      code=403,
+                  )
 
 
-              _MASTER_KEY_ALLOWED = set(LiteLLMRoutes.info_routes.value) | {
-                  "/spend/logs", "/spend/logs/v2", "/spend/calculate", "/spend/tags",
-                  "/global/spend", "/global/spend/logs", "/global/spend/report",
-                  "/global/spend/tags", "/global/spend/keys", "/global/spend/models",
-                  "/global/spend/provider", "/global/spend/end_users",
-                  "/global/activity", "/global/activity/model",
-                  "/global/activity/exceptions",
-                  "/key/info", "/key/health", "/key/list",
-                  "/user/info", "/v2/user/info", "/user/list",
-                  "/team/info", "/team/list", "/team/available",
-                  "/model/info", "/v1/model/info", "/models", "/v1/models",
-                  "/model_group/info", "/active/callbacks", "/settings",
-                  "/health", "/health/liveliness", "/health/liveness",
-                  "/health/readiness", "/health/services",
-              }
+              def _check(request, user_api_key_dict) -> None:
+                  if getattr(user_api_key_dict, "api_key", None) != LITELLM_PROXY_MASTER_KEY_ALIAS:
+                      return
+                  route = _auth.get_request_route(request=request)
+                  if RouteChecks.is_llm_api_route(route=route):
+                      raise _deny(route, "model calls need a virtual key")
+                  # The WebSocket path builds a synthetic scope without "method"; it only
+                  # serves realtime (an LLM route, refused above), so treat it as a write.
+                  method = (request.scope.get("method") or "").upper()
+                  if method not in _READ_METHODS:
+                      raise _deny(route, f"{method or 'non-HTTP'} is not allowed")
 
 
-              async def user_api_key_auth(request: Request, api_key: str):
-                  master_key = os.environ.get("PROXY_MASTER_KEY", "") or ""
-                  presented = (api_key or "").replace("Bearer ", "").strip()
-                  if master_key and presented == master_key:
-                      route = get_request_route(request=request)
-                      if route not in _MASTER_KEY_ALLOWED:
+              _is_public = _auth.route_in_additonal_public_routes
+              if not getattr(_is_public, "_access_policy", False):
+
+                  def _public_route(current_route: str) -> bool:
+                      return current_route in PUBLIC_ROUTES or _is_public(current_route=current_route)
+
+                  _public_route._access_policy = True  # type: ignore[attr-defined]
+                  _auth.route_in_additonal_public_routes = _public_route
+
+              # v1.106.0 renamed the builder to user_api_key_auth_builder and left
+              # _user_api_key_auth_builder as an alias that nothing in the module calls, so
+              # wrapping only the old name silently left the master key with full access.
+              # Wrap whichever is the real one and point both names at the wrapper.
+              _BUILDER_NAMES = ("user_api_key_auth_builder", "_user_api_key_auth_builder")
+              _builder = getattr(_auth, "user_api_key_auth_builder", None) or _auth._user_api_key_auth_builder
+              if not getattr(_builder, "_access_policy", False):
+
+                  async def _guarded_builder(*args, **kwargs):
+                      result = await _builder(*args, **kwargs)
+                      request = kwargs.get("request", args[0] if args else None)
+                      _check(request, result)
+                      return result
+
+                  _guarded_builder._access_policy = True  # type: ignore[attr-defined]
+                  for _name in _BUILDER_NAMES:
+                      if hasattr(_auth, _name):
+                          setattr(_auth, _name, _guarded_builder)
+                  verbose_proxy_logger.warning(
+                      "access_policy: master key read-only; public routes: %s", ", ".join(sorted(PUBLIC_ROUTES))
+                  )
+
+
+              _host_allowed = _url_utils._is_host_allowlisted
+              if not getattr(_host_allowed, "_access_policy", False):
+
+                  def _wildcard_host_allowed(hostname: str, effective_port: int) -> bool:
+                      if _host_allowed(hostname, effective_port):
+                          return True
+                      host = hostname.lower().rstrip(".")
+                      return any(
+                          entry.startswith("*.") and host.endswith(entry[1:].lower().rstrip("."))
+                          for entry in litellm.user_url_allowed_hosts or []
+                      )
+
+                  _wildcard_host_allowed._access_policy = True  # type: ignore[attr-defined]
+                  _url_utils._is_host_allowlisted = _wildcard_host_allowed
+
+
+              class MasterKeyGuard(CustomLogger):
+                  """Second line of defence on the LLM call path itself."""
+
+                  async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+                      if getattr(user_api_key_dict, "api_key", None) == LITELLM_PROXY_MASTER_KEY_ALIAS:
                           raise ProxyException(
-                              message=(
-                                  "master key is read-only: it can only read "
-                                  "usage/statistics. It cannot call models or "
-                                  "create/modify keys. Use an SSO-issued admin "
-                                  "virtual key for those operations."
-                              ),
+                              message="master key cannot call models. Use a virtual key created in the admin UI.",
                               type="auth_error",
                               param="api_key",
                               code=403,
                           )
-                  raise _Fallback()
-        # --- LiteLLM HTTPRoute (CloudFront) ---
+                      return data
+
+
+              proxy_handler_instance = MasterKeyGuard()
+            edge_policy.py: |
+              """Edge policy of the litellm/ stack: model calls only through Global Accelerator.
+
+              The stack has two public entry points onto one Envoy Gateway, both private
+              behind it (no public load balancer):
+                - CloudFront -> VPC Origin -> internal ALB -> Envoy, HTTPRoute litellm-cf:
+                  the admin UI and its SSO login;
+                - Global Accelerator -> internal NLB -> Envoy, HTTPRoute litellm-ga: the API.
+              Envoy stamps every request with X-LiteLLM-Edge (a `set`, so a client cannot pick
+              the value): `cloudfront` on litellm-cf, `global-accelerator` on litellm-ga.
+              CloudFront also adds its origin header X-CloudFront-Secret to every request,
+              which a viewer cannot remove.
+
+              A request that came through CloudFront may not call a model: every LLM,
+              pass-through, MCP, agent and search route — LiteLLM's own
+              RouteChecks.is_llm_api_route, the classification its key permissions use —
+              answers 403 whatever the key, before authentication. The model listing
+              (/v1/models, /models) stays: the UI reads it. Management routes (/key/*,
+              /user/*, /spend/*, /sso/*, /ui) are not LLM routes and keep working, so the UI
+              does; only its playground (it calls /chat/completions) is refused.
+
+              Not done at Envoy with a path list: LiteLLM serves hundreds of LLM routes and
+              aliases (/chat/completions, /engines/{model}/..., /openai/deployments/...,
+              /bedrock/*, /anthropic/*, /mcp, ...) and adds more every release; its own
+              classifier is the only list that keeps up.
+
+              Hooks the same auth builder as access_policy.py (load it after that one), plus
+              the pre-call hook as a second line on the model-call path. Coupled to the
+              pinned image like access_policy.py: the import fails loudly if internals move.
+              """
+
+              from litellm._logging import verbose_proxy_logger
+              from litellm.integrations.custom_logger import CustomLogger
+              from litellm.proxy._types import ProxyException
+              from litellm.proxy.auth import user_api_key_auth as _auth
+              from litellm.proxy.auth.route_checks import RouteChecks
+
+              EDGE_HEADER = "x-litellm-edge"
+              CLOUDFRONT_HEADER = "x-cloudfront-secret"
+              LISTING_ROUTES = frozenset({"/v1/models", "/models"})
+
+
+              def _via_cloudfront(headers) -> bool:
+                  if not headers:
+                      return False
+                  lower = {str(k).lower(): v for k, v in dict(headers).items()}
+                  return str(lower.get(EDGE_HEADER, "")).lower() == "cloudfront" or bool(lower.get(CLOUDFRONT_HEADER))
+
+
+              def _deny(route: str) -> ProxyException:
+                  return ProxyException(
+                      message=(
+                          f"model calls are not served through CloudFront ({route}). "
+                          "Call the Global Accelerator endpoint (stack output LiteLLMApiServer)."
+                      ),
+                      type="auth_error",
+                      param="api_key",
+                      code=403,
+                  )
+
+
+              def _check(request) -> None:
+                  if request is None or not _via_cloudfront(getattr(request, "headers", None)):
+                      return
+                  route = _auth.get_request_route(request=request)
+                  if route not in LISTING_ROUTES and RouteChecks.is_llm_api_route(route=route):
+                      raise _deny(route)
+
+
+              # v1.106.0 renamed the builder to user_api_key_auth_builder and kept
+              # _user_api_key_auth_builder as an unused alias: wrap the real one, point both
+              # names at the wrapper (as access_policy.py does, whose wrapper this wraps).
+              _BUILDER_NAMES = ("user_api_key_auth_builder", "_user_api_key_auth_builder")
+              _builder = getattr(_auth, "user_api_key_auth_builder", None) or _auth._user_api_key_auth_builder
+              if not getattr(_builder, "_edge_policy", False):
+
+                  async def _edge_guarded_builder(*args, **kwargs):
+                      _check(kwargs.get("request", args[0] if args else None))
+                      return await _builder(*args, **kwargs)
+
+                  _edge_guarded_builder._edge_policy = True  # type: ignore[attr-defined]
+                  _edge_guarded_builder._access_policy = getattr(_builder, "_access_policy", False)  # type: ignore[attr-defined]
+                  for _name in _BUILDER_NAMES:
+                      if hasattr(_auth, _name):
+                          setattr(_auth, _name, _edge_guarded_builder)
+                  verbose_proxy_logger.warning("edge_policy: no model calls through CloudFront (header %s)", EDGE_HEADER)
+
+
+              class CloudFrontModelCallGuard(CustomLogger):
+                  """Second line of defence on the LLM call path itself."""
+
+                  async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+                      request = (data or {}).get("proxy_server_request") or {}
+                      if _via_cloudfront(request.get("headers")):
+                          raise _deny(str(request.get("url") or call_type))
+                      return data
+
+
+              proxy_handler_instance = CloudFrontModelCallGuard()
+        # --- LiteLLM HTTPRoutes: CloudFront (UI/SSO) and GA (API) ---
+        # Both reach the same Service; X-LiteLLM-Edge records which edge a
+        # request came through (`set` overwrites any client-supplied value) and
+        # edge_policy.py refuses model calls stamped `cloudfront`. A request is
+        # matched by its Host: CloudFront forwards the viewer Host (origin
+        # request policy AllViewer), GA passes the TLS stream through to Envoy.
         - apiVersion: gateway.networking.k8s.io/v1
           kind: HTTPRoute
           metadata:
@@ -3317,10 +3619,15 @@ Resources:
                   - path:
                       type: PathPrefix
                       value: /
+                filters:
+                  - type: RequestHeaderModifier
+                    requestHeaderModifier:
+                      set:
+                        - name: X-LiteLLM-Edge
+                          value: cloudfront
                 backendRefs:
                   - name: litellm
                     port: 4000
-        # --- LiteLLM HTTPRoute (GA) ---
         - apiVersion: gateway.networking.k8s.io/v1
           kind: HTTPRoute
           metadata:
@@ -3337,6 +3644,12 @@ Resources:
                   - path:
                       type: PathPrefix
                       value: /
+                filters:
+                  - type: RequestHeaderModifier
+                    requestHeaderModifier:
+                      set:
+                        - name: X-LiteLLM-Edge
+                          value: global-accelerator
                 backendRefs:
                   - name: litellm
                     port: 4000
@@ -3363,6 +3676,11 @@ Resources:
                       path:
                         type: ReplaceFullPath
                         replaceFullPath: /ui/chat.html
+                  - type: RequestHeaderModifier
+                    requestHeaderModifier:
+                      set:
+                        - name: X-LiteLLM-Edge
+                          value: cloudfront
                 backendRefs:
                   - name: litellm
                     port: 4000
@@ -3377,31 +3695,31 @@ Resources:
               apiVersion: apps/v1
               kind: Deployment
               name: litellm
-            # Production: 2 replicas minimum for HA (survive a node/AZ loss and
-            # rolling restarts without dropping to zero capacity).
-            minReplicas: 2
-            # Cap scale-out to a sane bound. At ~5Gi request/pod, 20 pods is
-            # ~100Gi + 20 vCPU of requests — enough for large bursts while
-            # preventing a runaway fan-out (and runaway Karpenter/cost).
-            maxReplicas: 20
+            # 3 minimum: one pod can be lost (node, AZ, rolling update, PDB
+            # disruption) while two keep serving, spread over the AZs.
+            minReplicas: 3
+            # 30 x (2 CPU / 10Gi requested) = 60 vCPU / 300Gi, inside NodePool
+            # `cpu` limits (1000 CPU / 1000Gi) and the DB connection budget
+            # (database_connection_pool_limit above).
+            maxReplicas: 30
             metrics:
-              # Scale on CPU utilization ONLY. LiteLLM is an I/O-bound gateway:
-              # its memory is a fixed per-worker baseline (~3.7Gi at idle for
-              # num_workers=4), NOT a function of load — so a memory metric is a
-              # broken scaling signal (it reads "hot" even while idle and never
-              # converges). CPU tracks real request pressure.
+              # CPU only. LiteLLM is an I/O-bound gateway whose memory is a fixed
+              # per-worker baseline, not a function of load: a memory target reads
+              # "hot" while idle and pins the HPA at maxReplicas. 60% of the 2-CPU
+              # request (1.2 cores) leaves each pod headroom up to its 4-CPU limit
+              # while new pods start (~1-2 min: node + image + startup).
               - type: Resource
                 resource:
                   name: cpu
                   target:
                     type: Utilization
-                    averageUtilization: 70
+                    averageUtilization: 60
             behavior:
               scaleUp:
-                # React fast to load spikes, but not on transient blips.
-                stabilizationWindowSeconds: 60
+                # Short window: a spike must not wait for capacity, but a single
+                # 15s sample does not trigger it either.
+                stabilizationWindowSeconds: 30
                 policies:
-                # Allow either +100% or +4 pods per minute, whichever is greater.
                 - type: Percent
                   value: 100
                   periodSeconds: 60
@@ -3410,13 +3728,15 @@ Resources:
                   periodSeconds: 60
                 selectPolicy: Max
               scaleDown:
-                # Scale in conservatively (5min window) so long-lived streaming
-                # requests aren't disrupted by premature pod removal.
-                stabilizationWindowSeconds: 300
+                # Scale in slowly (10 min window, one pod per 3 min): load that
+                # oscillates does not flap pods, and the 660s grace period lets a
+                # removed pod finish its streams.
+                stabilizationWindowSeconds: 600
                 policies:
                 - type: Pods
                   value: 1
-                  periodSeconds: 120
+                  periodSeconds: 180
+                selectPolicy: Min
         # --- LiteLLM BackendTrafficPolicy: 5min timeout + streaming ---
         - apiVersion: gateway.envoyproxy.io/v1alpha1
           kind: BackendTrafficPolicy
@@ -3464,7 +3784,10 @@ Resources:
               http:
                 requestReceivedTimeout: "0s"
 
-  # Helm-based app deployment
+  # LiteLLM Helm deployment (upstream litellm-helm). Values = LiteLLMDeploy's
+  # LiteLLMValues (static, JSON) merged with the deploy-time endpoints, passed as
+  # one values file (-f) rather than --set, so typed values (prices, lists of
+  # dicts) reach config.yaml unchanged.
   HelmDeployFunction:
     Type: AWS::Lambda::Function
     DependsOn: QuotaCheck
@@ -3477,10 +3800,13 @@ Resources:
       Role: !GetAtt KubectlLambdaRole.Arn
       Code:
         ZipFile: |
-          import base64,json,logging,os,stat,subprocess,tempfile,time,urllib3,boto3
+          import base64,json,logging,os,secrets,stat,subprocess,tarfile,tempfile,time,urllib3,boto3
           from botocore.signers import RequestSigner
           L=logging.getLogger();L.setLevel(logging.INFO)
           HELM_URL="https://get.helm.sh/helm-v3.17.3-linux-amd64.tar.gz"
+          # Master-key values that must never stay in the Secret: the historical
+          # public key, and empty (it breaks the SSO UI-session JWT).
+          BANNED_MASTER_KEYS={"sk-litellm-proxy-master-key",""}
           def get_token(sess,cluster,region):
             sts=sess.client("sts",region_name=region);si=sts.meta.service_model.service_id
             sg=RequestSigner(si,region,"sts","v4",sess.get_credentials(),sess.events)
@@ -3493,290 +3819,99 @@ Resources:
           def install_helm():
             helm="/tmp/helm"
             if os.path.exists(helm):return helm
-            http=urllib3.PoolManager()
-            r=http.request("GET",HELM_URL)
+            r=urllib3.PoolManager().request("GET",HELM_URL)
             tgz="/tmp/helm.tar.gz"
             with open(tgz,"wb") as f:f.write(r.data)
-            import tarfile
             with tarfile.open(tgz,"r:gz") as t:
-              m=t.getmember("linux-amd64/helm")
-              m.name="helm"
-              t.extract(m,"/tmp")
+              m=t.getmember("linux-amd64/helm");m.name="helm";t.extract(m,"/tmp")
             os.chmod(helm,stat.S_IRWXU)
             return helm
+          def kube(sess,cn,region):
+            ci=sess.client("eks").describe_cluster(name=cn)["cluster"]
+            ca=tempfile.NamedTemporaryFile(delete=False,suffix=".crt")
+            ca.write(base64.b64decode(ci["certificateAuthority"]["data"]));ca.close()
+            kc={"apiVersion":"v1","kind":"Config","clusters":[{"cluster":{"server":ci["endpoint"],"certificate-authority":ca.name},"name":"c"}],"contexts":[{"context":{"cluster":"c","user":"u"},"name":"x"}],"current-context":"x","users":[{"name":"u","user":{"token":get_token(sess,cn,region)}}]}
+            kf=tempfile.NamedTemporaryFile(delete=False,suffix=".yaml",mode="w");json.dump(kc,kf);kf.close()
+            env={**os.environ,"KUBECONFIG":kf.name,"HELM_CACHE_HOME":"/tmp/helm-cache","HELM_CONFIG_HOME":"/tmp/helm-config","HELM_DATA_HOME":"/tmp/helm-data"}
+            return ci["endpoint"],ca.name,env
+          def litellm_values(props,sess,region):
+            # Static values (LiteLLMValues, JSON) + what is only known at deploy
+            # time: SSO client + endpoints, Aurora endpoint, Valkey.
+            vals=json.loads(props["LiteLLMValues"])
+            pool_id=props["UserPoolId"];client_id=props["ClientId"]
+            secret=sess.client("cognito-idp").describe_user_pool_client(UserPoolId=pool_id,ClientId=client_id)["UserPoolClient"].get("ClientSecret","")
+            cognito=f"https://{props['CognitoDomain']}.auth.{region}.amazoncognito.com"
+            env=vals.setdefault("envVars",{})
+            env.update({k:str(v) for k,v in (props.get("LiteLLMEnv") or {}).items()})
+            ui=env["PROXY_BASE_URL"].rstrip("/")+"/ui/"
+            env.update({"GENERIC_CLIENT_ID":client_id,"GENERIC_CLIENT_SECRET":secret,
+              "GENERIC_AUTHORIZATION_ENDPOINT":f"{cognito}/oauth2/authorize","GENERIC_TOKEN_ENDPOINT":f"{cognito}/oauth2/token",
+              "GENERIC_USERINFO_ENDPOINT":f"{cognito}/oauth2/userInfo","PROXY_LOGOUT_URL":f"{cognito}/logout?client_id={client_id}&logout_uri={ui}"})
+            vals.setdefault("db",{})["endpoint"]=props["AuroraEndpoint"]
+            vh=props["ValkeyHost"];vp=int(props.get("ValkeyPort","6379"));vpw=props["ValkeyPassword"]
+            pc=vals["proxy_config"]
+            pc.setdefault("litellm_settings",{})["cache_params"]={"type":"redis","host":vh,"port":vp,"password":vpw,"ssl":True,"ttl":600}
+            pc.setdefault("router_settings",{}).update({"redis_host":vh,"redis_port":vp,"redis_password":vpw})
+            env.update({"REDIS_HOST":vh,"REDIS_PORT":str(vp),"REDIS_PASSWORD":vpw,"REDIS_SSL":"True"})
+            return vals
+          def rotate_weak_master_key(ep,ca,sess,cn,region,ns,release):
+            # Defence in depth (non-fatal): a *masterkey* Secret holding a banned
+            # value is replaced by a strong random key and the Deployment restarted.
+            http=urllib3.PoolManager(cert_reqs="CERT_REQUIRED",ca_certs=ca)
+            tok=get_token(sess,cn,region)
+            sr=http.request("GET",f"{ep}/api/v1/namespaces/{ns}/secrets",headers={"Authorization":f"Bearer {tok}","Accept":"application/json"})
+            if sr.status!=200:L.warning(f"master-key scan: secret list HTTP {sr.status}");return
+            rotated=False
+            for s in json.loads(sr.data.decode()).get("items",[]):
+              snm=s.get("metadata",{}).get("name","")
+              if "masterkey" not in snm.lower():continue
+              fix={}
+              for dk,dv in (s.get("data") or {}).items():
+                try:val=base64.b64decode(dv).decode() if dv else ""
+                except Exception:val="?"
+                if val.strip() in BANNED_MASTER_KEYS:fix[dk]=base64.b64encode(f"sk-cnf-{secrets.token_urlsafe(32)}".encode()).decode()
+              if not fix:L.info(f"Master key Secret '{snm}' is strong (OK)");continue
+              L.warning(f"Master key Secret '{snm}' had weak value(s) {list(fix)}; rotating")
+              pr=http.request("PATCH",f"{ep}/api/v1/namespaces/{ns}/secrets/{snm}",headers={"Authorization":f"Bearer {tok}","Content-Type":"application/merge-patch+json","Accept":"application/json"},body=json.dumps({"data":fix}).encode())
+              L.info(f"Rotate Secret {snm}: HTTP {pr.status}");rotated=True
+            if rotated:
+              rp=json.dumps({"spec":{"template":{"metadata":{"annotations":{"cnf.masterkey/rotatedAt":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())}}}}}).encode()
+              rr=http.request("PATCH",f"{ep}/apis/apps/v1/namespaces/{ns}/deployments/{release}",headers={"Authorization":f"Bearer {tok}","Content-Type":"application/strategic-merge-patch+json","Accept":"application/json"},body=rp)
+              L.info(f"Restart deployment {release}: HTTP {rr.status}")
           def handler(event,ctx):
-            L.info(json.dumps(event,default=str))
+            ev=dict(event);ev["ResourceProperties"]={k:("<redacted>" if "Password" in k else v) for k,v in event["ResourceProperties"].items()}
+            L.info(json.dumps(ev,default=str))
             rt=event["RequestType"];props=event["ResourceProperties"]
+            cn=props["ClusterName"];ns=props["Namespace"];release=props["ReleaseName"]
+            region=props.get("Region",boto3.session.Session().region_name)
+            sess=boto3.Session(region_name=region)
             if rt=="Delete":
               try:
-                helm=install_helm()
-                cn=props["ClusterName"];ns=props["Namespace"]
-                region=props.get("Region",boto3.session.Session().region_name)
-                sess=boto3.Session(region_name=region)
-                eks=sess.client("eks");ci=eks.describe_cluster(name=cn)["cluster"]
-                ep=ci["endpoint"];ca_data=ci["certificateAuthority"]["data"]
-                ca_file=tempfile.NamedTemporaryFile(delete=False,suffix=".crt")
-                ca_file.write(base64.b64decode(ca_data));ca_file.flush();ca_file.close()
-                token=get_token(sess,cn,region)
-                kc={"apiVersion":"v1","kind":"Config","clusters":[{"cluster":{"server":ep,"certificate-authority":ca_file.name},"name":"c"}],"contexts":[{"context":{"cluster":"c","user":"u"},"name":"x"}],"current-context":"x","users":[{"name":"u","user":{"token":token}}]}
-                kf=tempfile.NamedTemporaryFile(delete=False,suffix=".yaml",mode="w")
-                json.dump(kc,kf);kf.flush();kf.close()
-                env={**os.environ,"KUBECONFIG":kf.name}
-                r=subprocess.run([helm,"uninstall",props.get("ReleaseName","cnf"),"-n",ns,"--ignore-not-found"],capture_output=True,text=True,env=env)
+                ep,ca,env=kube(sess,cn,region)
+                r=subprocess.run([install_helm(),"uninstall",release,"-n",ns,"--ignore-not-found"],capture_output=True,text=True,env=env)
                 L.info(f"Uninstall: {r.stdout} {r.stderr}")
               except Exception as e:
                 L.warning(f"Delete cleanup: {e}")
               send_cfn(event,ctx,"SUCCESS",pid="helm-deploy");return
             try:
-              cn=props["ClusterName"];ns=props["Namespace"]
-              region=props.get("Region",boto3.session.Session().region_name)
-              sess=boto3.Session(region_name=region)
-              # Get client secret
-              pool_id=props.get("UserPoolId","");client_id=props.get("ClientId","")
-              secret=""
-              if pool_id and client_id:
-                cog=sess.client("cognito-idp")
-                resp=cog.describe_user_pool_client(UserPoolId=pool_id,ClientId=client_id)
-                secret=resp["UserPoolClient"].get("ClientSecret","")
-              # Setup kubeconfig
               helm=install_helm()
-              eks=sess.client("eks");ci=eks.describe_cluster(name=cn)["cluster"]
-              ep=ci["endpoint"];ca_data=ci["certificateAuthority"]["data"]
-              ca_file=tempfile.NamedTemporaryFile(delete=False,suffix=".crt")
-              ca_file.write(base64.b64decode(ca_data));ca_file.flush();ca_file.close()
-              token=get_token(sess,cn,region)
-              kc={"apiVersion":"v1","kind":"Config","clusters":[{"cluster":{"server":ep,"certificate-authority":ca_file.name},"name":"c"}],"contexts":[{"context":{"cluster":"c","user":"u"},"name":"x"}],"current-context":"x","users":[{"name":"u","user":{"token":token}}]}
-              kf=tempfile.NamedTemporaryFile(delete=False,suffix=".yaml",mode="w")
-              json.dump(kc,kf);kf.flush();kf.close()
-              env={**os.environ,"KUBECONFIG":kf.name,"HELM_CACHE_HOME":"/tmp/helm-cache","HELM_CONFIG_HOME":"/tmp/helm-config","HELM_DATA_HOME":"/tmp/helm-data"}
-              # Build helm command
-              release=props.get("ReleaseName","cnf")
-              chart=props.get("ChartRef","oci://public.ecr.aws/b1y9i2f3/cnf")
-              version=props.get("ChartVersion","0.1.0")
-              wait_install=not props.get("LiteLLMConfig")
-              cmd=[helm,"upgrade","--install",release,chart,"--version",version,"--namespace",ns,"--create-namespace"]
-              if wait_install:cmd+=["--wait","--timeout","10m"]
-              sets=props.get("HelmSets",{})
-              for k,v in sets.items():
-                cmd+=["--set",f"{k}={v}"]
-              # GA all IPs as Helm array
-              ga_ips_key=props.get("GAIpsKey")
-              if ga_ips_key:
-                ips=[f"{ip}/32" for ip in props.get("GAIpv4s",[])]+[f"{ip}/128" for ip in props.get("GAIpv6s",[])]
-                cmd+=["--set",f"{ga_ips_key}={{{','.join(ips)}}}"]
-              # Add auth URI if cognito configured
-              if pool_id and client_id and secret:
-                issuer_host=f"cognito-idp.{region}.amazonaws.com/{pool_id}"
-                auth_uri=f"oidc://{client_id}:{secret}@{issuer_host}?scope=openid%20profile%20email&oidc_logout=false"
-                cmd+=["--set",f"scaffolding.config.auth={auth_uri}"]
-              # LiteLLM-specific config
-              if props.get("LiteLLMConfig"):
-                domain=f"cnf-{props.get('EnvironmentId','001')}-{boto3.client('sts').get_caller_identity()['Account']}"
-                cognito_base=f"https://{domain}.auth.{region}.amazoncognito.com"
-                litellm_env=props.get("LiteLLMEnv",{})
-                # DB endpoint from Aurora
-                db_ep=props.get("AuroraEndpoint","")
-                if db_ep:
-                  cmd+=["--set",f"db.endpoint={db_ep}"]
-                  cmd+=["--set","db.database=litellm"]
-                  cmd+=["--set","db.url=postgresql://$(DATABASE_USERNAME):$(DATABASE_PASSWORD)@$(DATABASE_HOST):5432/$(DATABASE_NAME)"]
-                # Cognito SSO env vars
-                cmd+=["--set",f"envVars.GENERIC_CLIENT_ID={client_id}"]
-                cmd+=["--set",f"envVars.GENERIC_CLIENT_SECRET={secret}"]
-                cmd+=["--set",f"envVars.GENERIC_AUTHORIZATION_ENDPOINT={cognito_base}/oauth2/authorize"]
-                cmd+=["--set",f"envVars.GENERIC_TOKEN_ENDPOINT={cognito_base}/oauth2/token"]
-                cmd+=["--set",f"envVars.GENERIC_USERINFO_ENDPOINT={cognito_base}/oauth2/userInfo"]
-                # Logout URL (use CloudFront host for UI redirect)
-                cf_host=litellm_env.get("CLOUDFRONT_HOST","")
-                ui_url=f"https://{cf_host}/ui/" if cf_host else ""
-                cmd+=["--set",f"envVars.PROXY_LOGOUT_URL={cognito_base}/logout?client_id={client_id}&logout_uri={ui_url}"]
-                # All other LiteLLM env vars
-                for ek,ev in litellm_env.items():
-                  if ek=="CLOUDFRONT_HOST":continue
-                  flag="--set-string" if "{" in str(ev) else "--set"
-                  # Helm --set-string interprets {} as array; use --set-json for dict values
-                  if "{" in str(ev) and ":" in str(ev):
-                    cmd+=["--set-json",f'envVars.{ek}={json.dumps(ev)}']
-                  else:
-                    cmd+=[flag,f"envVars.{ek}={ev}"]
-                # Args for IPv6 binding + num_workers for parallel processing
-                cmd+=["--set-string","args[0]=--config","--set-string","args[1]=/etc/litellm/config.yaml","--set-string","args[2]=--host","--set-string","args[3]=::","--set-string","args[4]=--num_workers","--set-string","args[5]=4"]
-                # Proxy config (model list): (model_name, litellm model path, extra litellm_params)
-                # Claude models route via the Bedrock Converse API using global
-                # cross-region inference profiles. GPT-5.4/5.5 are only served via
-                # the OpenAI-compatible bedrock-mantle endpoint (no Converse
-                # support) and are In-Region only, so aws_region_name must be
-                # pinned to us-east-2 per the AWS model cards:
-                # https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-55.html
-                models=[
-                  ("claude-sonnet-4-6","bedrock/global.anthropic.claude-sonnet-4-6",{}),
-                  ("claude-opus-4-6","bedrock/global.anthropic.claude-opus-4-6-v1",{}),
-                  ("claude-sonnet-4-5-20250929","bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0",{}),
-                  ("claude-opus-4-5-20251101","bedrock/global.anthropic.claude-opus-4-5-20251101-v1:0",{}),
-                  ("claude-haiku-4-5-20251001","bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0",{}),
-                  ("claude-opus-4-8","bedrock/global.anthropic.claude-opus-4-8",{}),
-                  ("claude-sonnet-5","bedrock/global.anthropic.claude-sonnet-5",{}),
-                  ("claude-fable-5","bedrock/global.anthropic.claude-fable-5",{}),
-                  ("gpt-5.4","bedrock_mantle/openai.gpt-5.4",{"aws_region_name":"us-east-2"}),
-                  ("gpt-5.5","bedrock_mantle/openai.gpt-5.5",{"aws_region_name":"us-east-2"}),
-                ]
-                for i,(mn,mp,mx) in enumerate(models):
-                  cmd+=["--set",f"proxy_config.model_list[{i}].model_name={mn}","--set",f"proxy_config.model_list[{i}].litellm_params.model={mp}"]
-                  for xk,xv in mx.items():
-                    cmd+=["--set",f"proxy_config.model_list[{i}].litellm_params.{xk}={xv}"]
-                # Wildcard: allow all bedrock models via pass-through
-                idx=len(models)
-                cmd+=["--set",f"proxy_config.model_list[{idx}].model_name=bedrock/*","--set",f"proxy_config.model_list[{idx}].litellm_params.model=bedrock/*","--set",f"proxy_config.model_list[{idx}].litellm_params.aws_region_name={props.get('BedrockWildcardRegion','us-west-2')}"]
-                cmd+=["--set","proxy_config.general_settings.master_key=os.environ/PROXY_MASTER_KEY"]
-                # Restrict the master key to READ-ONLY (usage/stats): it cannot
-                # call models or create/modify keys. The module is mounted at
-                # /etc/litellm/ (see volumes/volumeMounts below); LiteLLM resolves
-                # custom_auth relative to the config dir. mode=auto => the hook
-                # only owns the master-key deny path; all other creds defer to
-                # built-in auth. Admins operate via SSO-issued virtual keys.
-                cmd+=["--set","proxy_config.general_settings.custom_auth=litellm_master_key_readonly.user_api_key_auth"]
-                cmd+=["--set","proxy_config.general_settings.custom_auth_settings.mode=auto"]
-                # Mount the custom_auth ConfigMap (created in K8sAppResources).
-                cmd+=["--set-json",'volumes=[{"name":"custom-auth","configMap":{"name":"litellm-custom-auth"}}]']
-                cmd+=["--set-json",'volumeMounts=[{"name":"custom-auth","mountPath":"/etc/litellm/litellm_master_key_readonly.py","subPath":"litellm_master_key_readonly.py"}]']
-                cmd+=["--set","proxy_config.general_settings.forward_client_headers_to_llm_api=false"]
-                cmd+=["--set","proxy_config.general_settings.store_prompts_in_spend_logs=true"]
-                cmd+=["--set","proxy_config.general_settings.maximum_spend_logs_retention_period=7d"]
-                cmd+=["--set","proxy_config.general_settings.proxy_batch_write_at=30"]
-                cmd+=["--set","proxy_config.general_settings.disable_error_logs=true"]
-                cmd+=["--set","proxy_config.general_settings.allow_requests_on_db_unavailable=true"]
-                cmd+=["--set","proxy_config.general_settings.database_connection_pool_limit=24"]
-                cmd+=["--set","proxy_config.general_settings.max_parallel_requests=100"]
-                cmd+=["--set","proxy_config.general_settings.global_max_parallel_requests=500"]
-                cmd+=["--set","proxy_config.litellm_settings.drop_params=true"]
-                cmd+=["--set","proxy_config.litellm_settings.set_verbose=false"]
-                cmd+=["--set","proxy_config.litellm_settings.json_logs=true"]
-                cmd+=["--set","proxy_config.litellm_settings.request_timeout=600"]
-                cmd+=["--set","proxy_config.litellm_settings.cache=true"]
-                # Security: require every virtual key to carry a budget so a
-                # leaked key is self-limiting (capped spend, no open-ended risk).
-                # Enforced for team/non-admin key creation; proxy_admin callers
-                # bypass required_params (see docs/helm.md §9). Budgets are still
-                # enforced at spend time regardless of issuer.
-                cmd+=["--set-json",'proxy_config.litellm_settings.key_generation_settings={"team_key_generation":{"required_params":["max_budget","budget_duration"]},"personal_key_generation":{"required_params":["max_budget","budget_duration"]}}']
-                # Valkey/Redis cache via ElastiCache Serverless
-                valkey_host=props.get("ValkeyHost","")
-                valkey_port=props.get("ValkeyPort","6379")
-                valkey_pw=props.get("ValkeyPassword","")
-                if valkey_host:
-                  cmd+=["--set",f"proxy_config.litellm_settings.cache_params.type=redis"]
-                  cmd+=["--set",f"proxy_config.litellm_settings.cache_params.host={valkey_host}"]
-                  cmd+=["--set",f"proxy_config.litellm_settings.cache_params.port={valkey_port}"]
-                  cmd+=["--set",f"proxy_config.litellm_settings.cache_params.password={valkey_pw}"]
-                  cmd+=["--set","proxy_config.litellm_settings.cache_params.ssl=true"]
-                  cmd+=["--set","proxy_config.litellm_settings.cache_params.ttl=600"]
-                  cmd+=["--set",f"proxy_config.router_settings.redis_host={valkey_host}"]
-                  cmd+=["--set",f"proxy_config.router_settings.redis_port={valkey_port}"]
-                  cmd+=["--set",f"proxy_config.router_settings.redis_password={valkey_pw}"]
-                  cmd+=["--set","proxy_config.router_settings.routing_strategy=simple-shuffle"]
-                  cmd+=["--set-string",f"envVars.REDIS_HOST={valkey_host}"]
-                  cmd+=["--set-string",f"envVars.REDIS_PORT={valkey_port}"]
-                  cmd+=["--set-string",f"envVars.REDIS_PASSWORD={valkey_pw}"]
-                  cmd+=["--set-string","envVars.REDIS_SSL=True"]
-                # Static LiteLLM helm values (split by type)
-                # NOTE: NO "masterkey" is set here. Instead we point the chart at the
-                # pre-created, INTENTIONALLY EMPTY "litellm-masterkey" Secret (see
-                # K8sAppResources) via masterkeySecretName/masterkeySecretKey. This
-                # both (a) suppresses the chart's default behaviour of auto-generating
-                # a random "sk-..." master key Secret, and (b) leaves the injected
-                # PROXY_MASTER_KEY env var empty, so LiteLLM has NO functional master
-                # key — all admin/inference endpoints return 401 and auth is handled
-                # exclusively via Cognito SSO. Verified empirically on EKS.
-                for sk,sv in {"masterkeySecretName":"litellm-masterkey","masterkeySecretKey":"masterkey","service.type":"ClusterIP","service.port":"4000","serviceAccount.create":"false","serviceAccount.name":"litellm-sa","db.useExisting":"true","db.deployStandalone":"false","db.secret.name":"postgres-creds","db.secret.usernameKey":"username","db.secret.passwordKey":"password","migrationJob.enabled":"true","redis.enabled":"false","ingress.enabled":"false","nodeSelector.kubernetes\\.io/arch":"arm64","startupProbe.path":"/health/readiness","startupProbe.initialDelaySeconds":"30","startupProbe.periodSeconds":"10","startupProbe.failureThreshold":"60","livenessProbe.path":"/health/liveliness","readinessProbe.path":"/health/readiness","strategy.type":"RollingUpdate"}.items():
-                  cmd+=["--set",f"{sk}={sv}"]
-                # Production sizing. Memory request 5Gi matches the ~3.7Gi idle
-                # baseline of num_workers=4 plus headroom, so the scheduler packs
-                # pods honestly (no node oversubscription -> no cascading OOM).
-                # Limit 8Gi absorbs concurrency / long-context spikes without
-                # OOMKill. CPU request 1 gives the HPA a meaningful 70% base
-                # (=700m); limit 4 lets a busy pod use spare cores.
-                for sk,sv in {"resources.requests.cpu":"1000m","resources.requests.memory":"5Gi","resources.limits.cpu":"4000m","resources.limits.memory":"8Gi"}.items():
-                  cmd+=["--set-string",f"{sk}={sv}"]
-                for sk,sv in {"strategy.rollingUpdate.maxUnavailable":"0","strategy.rollingUpdate.maxSurge":"1"}.items():
-                  cmd+=["--set",f"{sk}={sv}"]
-                # TopologySpreadConstraints for multi-AZ distribution
-                cmd+=["--set-json","topologySpreadConstraints=[{\"maxSkew\":1,\"topologyKey\":\"topology.kubernetes.io/zone\",\"whenUnsatisfiable\":\"DoNotSchedule\",\"labelSelector\":{\"matchLabels\":{\"app.kubernetes.io/name\":\"litellm\"}}},{\"maxSkew\":2,\"topologyKey\":\"kubernetes.io/hostname\",\"whenUnsatisfiable\":\"ScheduleAnyway\",\"labelSelector\":{\"matchLabels\":{\"app.kubernetes.io/name\":\"litellm\"}}}]"]
-              L.info(f"Running: {' '.join(cmd[:8])}...")
+              ep,ca,env=kube(sess,cn,region)
+              vf=tempfile.NamedTemporaryFile(delete=False,suffix=".json",mode="w")
+              json.dump(litellm_values(props,sess,region),vf);vf.close()
+              # No --wait: the first start (image pull, Prisma migrations) can
+              # outlast this Lambda; NlbHealthCheck runs after it.
+              cmd=[helm,"upgrade","--install",release,props["ChartRef"],"--version",props["ChartVersion"],"--namespace",ns,"--create-namespace","-f",vf.name]
+              L.info(f"Running: {' '.join(cmd[:8])} -f <values>")
               r=subprocess.run(cmd,capture_output=True,text=True,env=env,timeout=540)
               L.info(f"stdout: {r.stdout}")
               if r.returncode!=0:
                 L.error(f"stderr: {r.stderr}")
                 send_cfn(event,ctx,"FAILED",reason=r.stderr[:256]);return
-              # --- SAFETY NET: master key must be strong + never the old public one ---
-              # The master key is required (it signs the SSO UI JWT) but is made
-              # read-only by the custom_auth hook. Defence-in-depth: after every
-              # deploy, scan the litellm namespace and, if any "*masterkey*" Secret
-              # holds the historical hardcoded/public value (or an empty value that
-              # would break SSO login), replace it with a strong random key and
-              # restart the deployment. Non-fatal (best-effort).
-              if props.get("LiteLLMConfig"):
-                try:
-                  import secrets as _secrets
-                  BANNED={"sk-litellm-proxy-master-key",""}  # public/legacy + empty
-                  http=urllib3.PoolManager(cert_reqs="CERT_REQUIRED",ca_certs=ca_file.name)
-                  tok=get_token(sess,cn,region)
-                  hd_g={"Authorization":f"Bearer {tok}","Accept":"application/json"}
-                  sr=http.request("GET",f"{ep}/api/v1/namespaces/{ns}/secrets",headers=hd_g)
-                  rotated=False
-                  if sr.status==200:
-                    for s in json.loads(sr.data.decode()).get("items",[]):
-                      snm=s.get("metadata",{}).get("name","")
-                      if "masterkey" not in snm.lower():continue
-                      data=s.get("data",{}) or {}
-                      fix={}
-                      for dk,dv in data.items():
-                        try:val=base64.b64decode(dv).decode() if dv else ""
-                        except Exception:val="?"
-                        if val.strip() in BANNED:
-                          fix[dk]=base64.b64encode(f"sk-cnf-{_secrets.token_urlsafe(32)}".encode()).decode()
-                      if fix:
-                        L.warning(f"Master key Secret '{snm}' had weak/banned value(s) {list(fix.keys())}; rotating to strong random")
-                        patch=json.dumps({"data":fix}).encode()
-                        hd_p={"Authorization":f"Bearer {tok}","Content-Type":"application/merge-patch+json","Accept":"application/json"}
-                        pr=http.request("PATCH",f"{ep}/api/v1/namespaces/{ns}/secrets/{snm}",headers=hd_p,body=patch)
-                        L.info(f"Rotate Secret {snm}: HTTP {pr.status}");rotated=True
-                      else:
-                        L.info(f"Master key Secret '{snm}' is strong (OK)")
-                  else:
-                    L.warning(f"Secret list for master-key scan returned HTTP {sr.status}")
-                  if rotated:
-                    tok=get_token(sess,cn,region)
-                    hd_r={"Authorization":f"Bearer {tok}","Content-Type":"application/strategic-merge-patch+json","Accept":"application/json"}
-                    rp=json.dumps({"spec":{"template":{"metadata":{"annotations":{"cnf.masterkey/rotatedAt":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())}}}}}).encode()
-                    rr=http.request("PATCH",f"{ep}/apis/apps/v1/namespaces/{ns}/deployments/{release}",headers=hd_r,body=rp)
-                    L.info(f"Restart deployment {release} after rotate: HTTP {rr.status}")
-                except Exception as mke:
-                  L.warning(f"Master key safety-net (non-fatal): {mke}")
+              try:rotate_weak_master_key(ep,ca,sess,cn,region,ns,release)
+              except Exception as mke:L.warning(f"Master key safety-net (non-fatal): {mke}")
               send_cfn(event,ctx,"SUCCESS",data={"Release":release,"Namespace":ns},pid="helm-deploy")
             except Exception as e:
               L.exception("fail");send_cfn(event,ctx,"FAILED",reason=str(e)[:256])
-
-  HelmDeploy:
-    Type: Custom::HelmDeploy
-    DependsOn:
-      - LiteLLMDeploy
-      - CognitoOidcSetup
-    Properties:
-      ServiceToken: !GetAtt HelmDeployFunction.Arn
-      ClusterName: !Ref EksCluster
-      Region: !Ref "AWS::Region"
-      Namespace: !Sub "cnf-${EnvironmentId}"
-      ReleaseName: !Sub "cnf-${EnvironmentId}"
-      ChartRef: "oci://public.ecr.aws/b1y9i2f3/cnf"
-      ChartVersion: "0.2.0"
-      UserPoolId: !Ref CognitoUserPool
-      ClientId: !Ref CognitoUserPoolClient
-      HelmSets:
-        global.gatewayNamespace: envoy-gateway-system
-        scaffolding.host.frontend: !GetAtt CloudFrontDistribution.DomainName
-        scaffolding.host.backend: !GetAtt GlobalAccelerator.DualStackDnsName
-        scaffolding.irsaRoleArn: !GetAtt PodRole.Arn
-        scaffolding.rootPath: !Ref AppRootPath
 
   # --- LiteLLM Helm Deployment ---
   LiteLLMDeploy:
@@ -3794,26 +3929,139 @@ Resources:
       Namespace: litellm
       ReleaseName: litellm
       ChartRef: "oci://docker.litellm.ai/berriai/litellm-helm"
-      ChartVersion: "1.91.0"
+      # The policy callbacks (K8sAppResources: litellm-policy) patch internals of
+      # this exact version: bump chart, image.tag and re-run the checks of
+      # API.md §7 together.
+      ChartVersion: "1.106.6"
       UserPoolId: !Ref CognitoUserPool
       ClientId: !Ref LiteLLMCognitoClient
+      CognitoDomain: !Ref CognitoUserPoolDomain
       AuroraEndpoint: !GetAtt AuroraCluster.Endpoint.Address
-      EnvironmentId: !Ref EnvironmentId
-      BedrockWildcardRegion: !FindInMap [BedrockConfig, !Ref "AWS::Region", WildcardRegion]
       ValkeyHost: !GetAtt ValkeyCache.Endpoint.Address
       ValkeyPort: !GetAtt ValkeyCache.Endpoint.Port
       ValkeyPassword: !Sub "${ProjectName}${EnvironmentId}Valkey2026!"
-      LiteLLMConfig: "true"
       LiteLLMEnv:
         SERVER_ROOT_PATH: ""
+        # The UI and the SSO callback live on CloudFront; the API on GA.
         PROXY_BASE_URL: !Sub "https://${CloudFrontDistribution.DomainName}"
-        CLOUDFRONT_HOST: !GetAtt CloudFrontDistribution.DomainName
         GENERIC_CLIENT_STATE: "litellm-sso"
         AUTO_REDIRECT_UI_LOGIN_TO_SSO: "true"
         GENERIC_ROLE_MAPPINGS_GROUP_CLAIM: "groups"
         GENERIC_ROLE_MAPPINGS_ROLES: "{'proxy_admin': ['admin']}"
-        LITELLM_MODE: "PRODUCTION"
-        LITELLM_LOG: "ERROR"
+      # Static Helm values. Notes, by key:
+      #   image: v1.106.6, the tag base/ runs (base/values.yaml litellm.image.tag).
+      #   masterkeySecretName: the per-stack key of K8sAppResources; read-only
+      #     through access_policy.py. disable_env_credential_login: it cannot be
+      #     used as the UI password either — the UI is entered through Cognito SSO.
+      #   callbacks: access_policy (read-only master key) then edge_policy (no
+      #     model calls through CloudFront); order matters, both wrap one function.
+      #   store_model_in_db false: model_list below is the whole catalogue; the UI
+      #     cannot add models.
+      #   store_prompts_in_spend_logs false: as base/ — no prompt or response
+      #     text in the database.
+      #   key_generation_settings: every team / personal key needs a budget.
+      #   model_list: the Bedrock models litellm-model-discovery selects
+      #     (docker/litellm-model-discovery/configs/config.yaml rules: Claude >= 5.5
+      #     via InvokeModel, GPT >= 6 via bedrock-mantle Responses API, GLM >= 5.3,
+      #     Kimi >= 3 without prompt caching, Cohere embed >= 4), with the same
+      #     names, backends, prices and capabilities as it writes into base/
+      #     (read from base's /model/info on 2026-10-29). No bedrock/* wildcard.
+      #   Sizing (per pod, num_workers 4): requests 2 CPU / 10Gi, limits 4 CPU /
+      #     10Gi. Memory request == limit: the node never over-commits memory, so
+      #     a busy neighbour cannot get this pod OOM-killed or evicted; 4 workers
+      #     idle near 3.7Gi, leaving ~6Gi for long-context / streaming bursts. One
+      #     pod fits an m8g.xlarge (4 vCPU / 16GiB) of NodePool `cpu`. CPU limit
+      #     2x the request: bursts use spare cores, the HPA sees real load.
+      #   Stability: probes with 10s timeouts (a saturated worker must not be
+      #     restarted by its liveness probe); preStop sleep 20s so Envoy drops the
+      #     endpoint before the pod stops accepting; terminationGracePeriod 660s
+      #     = the 600s request timeout + drain, so a scale-in never cuts a long
+      #     stream; PDB maxUnavailable 1 against node consolidation / upgrades;
+      #     maxSurge 25% (rolling update never below current capacity).
+      #   database_connection_pool_limit 10 is per worker: 4 x 10 x maxReplicas
+      #     30 = 1200 connections, within Aurora's max_connections at MaxCapacity 8.
+      #   HPA: K8sAppResources (litellm-hpa, CPU only), not the chart's.
+      LiteLLMValues: !Sub
+        - |
+          {
+            "image": {"repository": "ghcr.io/berriai/litellm", "tag": "v1.106.6", "pullPolicy": "IfNotPresent"},
+            "masterkeySecretName": "litellm-masterkey",
+            "masterkeySecretKey": "masterkey",
+            "serviceAccount": {"create": false, "name": "litellm-sa"},
+            "service": {"type": "ClusterIP", "port": 4000},
+            "db": {"useExisting": true, "deployStandalone": false, "database": "litellm",
+                   "url": "postgresql://$(DATABASE_USERNAME):$(DATABASE_PASSWORD)@$(DATABASE_HOST):5432/$(DATABASE_NAME)",
+                   "secret": {"name": "postgres-creds", "usernameKey": "username", "passwordKey": "password"}},
+            "migrationJob": {"enabled": true},
+            "redis": {"enabled": false},
+            "ingress": {"enabled": false},
+            "nodeSelector": {"kubernetes.io/arch": "arm64"},
+            "args": ["--config", "/etc/litellm/config.yaml", "--host", "::", "--num_workers", "4"],
+            "startupProbe": {"path": "/health/readiness", "initialDelaySeconds": 30, "periodSeconds": 10, "timeoutSeconds": 10, "failureThreshold": 60},
+            "livenessProbe": {"path": "/health/liveliness", "periodSeconds": 15, "timeoutSeconds": 10, "failureThreshold": 6},
+            "readinessProbe": {"path": "/health/readiness", "periodSeconds": 10, "timeoutSeconds": 10, "failureThreshold": 3},
+            "strategy": {"type": "RollingUpdate", "rollingUpdate": {"maxUnavailable": 0, "maxSurge": "25%"}},
+            "resources": {"requests": {"cpu": "2000m", "memory": "10Gi"}, "limits": {"cpu": "4000m", "memory": "10Gi"}},
+            "terminationGracePeriodSeconds": 660,
+            "lifecycle": {"preStop": {"exec": {"command": ["/usr/bin/sleep", "20"]}}},
+            "pdb": {"enabled": true, "maxUnavailable": 1},
+            "topologySpreadConstraints": [
+              {"maxSkew": 1, "topologyKey": "topology.kubernetes.io/zone", "whenUnsatisfiable": "DoNotSchedule",
+               "labelSelector": {"matchLabels": {"app.kubernetes.io/name": "litellm"}}},
+              {"maxSkew": 2, "topologyKey": "kubernetes.io/hostname", "whenUnsatisfiable": "ScheduleAnyway",
+               "labelSelector": {"matchLabels": {"app.kubernetes.io/name": "litellm"}}}
+            ],
+            "volumes": [{"name": "litellm-policy", "configMap": {"name": "litellm-policy"}}],
+            "volumeMounts": [
+              {"name": "litellm-policy", "mountPath": "/etc/litellm/access_policy.py", "subPath": "access_policy.py", "readOnly": true},
+              {"name": "litellm-policy", "mountPath": "/etc/litellm/edge_policy.py", "subPath": "edge_policy.py", "readOnly": true}
+            ],
+            "envVars": {"LITELLM_MODE": "PRODUCTION", "LITELLM_LOG": "ERROR", "LITELLM_TELEMETRY": "False"},
+            "proxy_config": {
+              "general_settings": {
+                "master_key": "os.environ/PROXY_MASTER_KEY",
+                "disable_env_credential_login": true,
+                "store_model_in_db": false,
+                "allow_requests_on_db_unavailable": true,
+                "database_connection_pool_limit": 10,
+                "maximum_spend_logs_retention_period": "7d",
+                "store_prompts_in_spend_logs": false,
+                "disable_error_logs": true,
+                "forward_client_headers_to_llm_api": false,
+                "proxy_batch_write_at": 30,
+                "max_parallel_requests": 100,
+                "global_max_parallel_requests": 500
+              },
+              "litellm_settings": {
+                "callbacks": ["access_policy.proxy_handler_instance", "edge_policy.proxy_handler_instance"],
+                "drop_params": true,
+                "set_verbose": false,
+                "json_logs": true,
+                "request_timeout": 600,
+                "cache": true,
+                "key_generation_settings": {
+                  "team_key_generation": {"required_params": ["max_budget", "budget_duration"]},
+                  "personal_key_generation": {"required_params": ["max_budget", "budget_duration"]}
+                }
+              },
+              "router_settings": {"routing_strategy": "simple-shuffle"},
+              "model_list": [
+              {"model_name": "claude-opus-5-5", "litellm_params": {"model": "bedrock/invoke/global.anthropic.claude-opus-5-5", "aws_region_name": "${BedrockRegion}", "input_cost_per_token": 4e-06, "output_cost_per_token": 2e-05, "cache_read_input_token_cost": 2e-07, "cache_creation_input_token_cost": 5e-06, "cache_creation_input_token_cost_above_1hr": 8e-06, "cache_control_injection_points": [{"role": "system", "location": "message"}, {"index": -1, "location": "message"}]}, "model_info": {"max_input_tokens": 1000000, "max_output_tokens": 128000, "max_tokens": 128000, "mode": "chat", "supports_adaptive_thinking": true, "supports_computer_use": true, "supports_function_calling": true, "supports_max_reasoning_effort": true, "supports_mid_conversation_system": true, "supports_output_config": true, "supports_parallel_tool_use_config": true, "supports_pdf_input": true, "supports_prompt_caching": true, "supports_reasoning": true, "supports_response_schema": true, "supports_tool_choice": true, "supports_tool_search": true, "supports_vision": true, "supports_xhigh_reasoning_effort": true}},
+              {"model_name": "claude-sonnet-5-5", "litellm_params": {"model": "bedrock/invoke/global.anthropic.claude-sonnet-5-5", "aws_region_name": "${BedrockRegion}", "input_cost_per_token": 2e-06, "output_cost_per_token": 1e-05, "cache_read_input_token_cost": 1e-07, "cache_creation_input_token_cost": 2.5e-06, "cache_creation_input_token_cost_above_1hr": 4e-06, "cache_control_injection_points": [{"role": "system", "location": "message"}, {"index": -1, "location": "message"}]}, "model_info": {"max_input_tokens": 1000000, "max_output_tokens": 128000, "max_tokens": 128000, "mode": "chat", "supports_adaptive_thinking": true, "supports_bedrock_native_structured_output": true, "supports_computer_use": true, "supports_function_calling": true, "supports_max_reasoning_effort": true, "supports_mid_conversation_system": true, "supports_output_config": true, "supports_parallel_tool_use_config": true, "supports_pdf_input": true, "supports_prompt_caching": true, "supports_reasoning": true, "supports_response_schema": true, "supports_tool_choice": true, "supports_tool_search": true, "supports_vision": true, "supports_xhigh_reasoning_effort": true}},
+              {"model_name": "claude-haiku-5-5", "litellm_params": {"model": "bedrock/invoke/global.anthropic.claude-haiku-5-5", "aws_region_name": "${BedrockRegion}", "input_cost_per_token": 1e-07, "output_cost_per_token": 5e-07, "cache_read_input_token_cost": 1e-08, "cache_creation_input_token_cost": 1.25e-07, "cache_creation_input_token_cost_above_1hr": 2e-07, "cache_control_injection_points": [{"role": "system", "location": "message"}, {"index": -1, "location": "message"}]}, "model_info": {"max_input_tokens": 1000000, "max_output_tokens": 128000, "max_tokens": 128000, "mode": "chat", "supports_adaptive_thinking": true, "supports_bedrock_native_structured_output": true, "supports_computer_use": true, "supports_forced_tool_use": true, "supports_function_calling": true, "supports_max_reasoning_effort": true, "supports_mid_conversation_system": true, "supports_output_config": true, "supports_parallel_tool_use_config": true, "supports_pdf_input": true, "supports_prompt_caching": true, "supports_reasoning": true, "supports_response_schema": true, "supports_tool_choice": true, "supports_tool_search": true, "supports_vision": true, "supports_xhigh_reasoning_effort": true}},
+              {"model_name": "gpt-6-astra", "litellm_params": {"model": "bedrock_mantle/openai.gpt-6-astra", "aws_region_name": "${BedrockMantleRegion}", "input_cost_per_token": 1.1e-05, "output_cost_per_token": 5.5e-05, "cache_read_input_token_cost": 1.1e-06, "cache_creation_input_token_cost": 1.375e-05, "cache_creation_input_token_cost_above_272k_tokens": 2.75e-05, "cache_read_input_token_cost_above_272k_tokens": 2.2e-06, "input_cost_per_token_above_272k_tokens": 2.2e-05, "output_cost_per_token_above_272k_tokens": 8.25e-05}, "model_info": {"max_input_tokens": 922000, "max_output_tokens": 128000, "max_tokens": 128000, "mode": "responses", "supports_function_calling": true, "supports_max_reasoning_effort": true, "supports_prompt_cache_breakpoint": true, "supports_prompt_caching": true, "supports_reasoning": true, "supports_response_schema": true, "supports_tool_choice": true, "supports_vision": true, "supports_xhigh_reasoning_effort": true}},
+              {"model_name": "gpt-6-sol", "litellm_params": {"model": "bedrock_mantle/openai.gpt-6-sol", "aws_region_name": "${BedrockMantleRegion}", "input_cost_per_token": 2.2e-06, "output_cost_per_token": 1.1e-05, "cache_read_input_token_cost": 2.2e-07, "cache_creation_input_token_cost": 2.75e-06, "cache_creation_input_token_cost_above_272k_tokens": 5.5e-06, "cache_read_input_token_cost_above_272k_tokens": 4.4e-07, "input_cost_per_token_above_272k_tokens": 4.4e-06, "output_cost_per_token_above_272k_tokens": 1.65e-05}, "model_info": {"max_input_tokens": 922000, "max_output_tokens": 128000, "max_tokens": 128000, "mode": "responses", "supports_function_calling": true, "supports_max_reasoning_effort": true, "supports_none_reasoning_effort": true, "supports_prompt_cache_breakpoint": true, "supports_prompt_caching": true, "supports_reasoning": true, "supports_response_schema": true, "supports_tool_choice": true, "supports_vision": true, "supports_xhigh_reasoning_effort": true}},
+              {"model_name": "gpt-6-luna", "litellm_params": {"model": "bedrock_mantle/openai.gpt-6-luna", "aws_region_name": "${BedrockMantleRegion}", "input_cost_per_token": 1.1e-07, "output_cost_per_token": 5.5e-07, "cache_read_input_token_cost": 1.1e-08, "cache_creation_input_token_cost": 1.375e-07, "cache_creation_input_token_cost_above_272k_tokens": 2.75e-07, "cache_read_input_token_cost_above_272k_tokens": 2.2e-08, "input_cost_per_token_above_272k_tokens": 2.2e-07, "output_cost_per_token_above_272k_tokens": 8.25e-07}, "model_info": {"max_input_tokens": 922000, "max_output_tokens": 128000, "max_tokens": 128000, "mode": "responses", "supports_function_calling": true, "supports_max_reasoning_effort": true, "supports_none_reasoning_effort": true, "supports_prompt_cache_breakpoint": true, "supports_prompt_caching": true, "supports_reasoning": true, "supports_response_schema": true, "supports_tool_choice": true, "supports_vision": true, "supports_xhigh_reasoning_effort": true}},
+              {"model_name": "gpt-6.1-sol", "litellm_params": {"model": "bedrock_mantle/openai.gpt-6.1-sol", "aws_region_name": "${BedrockMantleRegion}", "input_cost_per_token": 2.2e-06, "output_cost_per_token": 1.1e-05, "cache_read_input_token_cost": 1.1e-07, "cache_creation_input_token_cost": 2.75e-06, "cache_creation_input_token_cost_above_272k_tokens": 5.5e-06, "cache_read_input_token_cost_above_272k_tokens": 2.2e-07, "input_cost_per_token_above_272k_tokens": 4.4e-06, "output_cost_per_token_above_272k_tokens": 1.65e-05}, "model_info": {"max_input_tokens": 1000000, "max_output_tokens": 131072, "max_tokens": 131072, "mode": "responses", "supports_function_calling": true, "supports_max_reasoning_effort": true, "supports_prompt_cache_breakpoint": true, "supports_prompt_caching": true, "supports_reasoning": true, "supports_response_schema": true, "supports_tool_choice": true, "supports_vision": true, "supports_xhigh_reasoning_effort": true}},
+              {"model_name": "gpt-6.1-terra", "litellm_params": {"model": "bedrock_mantle/openai.gpt-6.1-terra", "aws_region_name": "${BedrockMantleRegion}", "input_cost_per_token": 1.1e-06, "output_cost_per_token": 5.5e-06, "cache_read_input_token_cost": 5.5e-08, "cache_creation_input_token_cost": 1.375e-06, "cache_creation_input_token_cost_above_272k_tokens": 2.75e-06, "cache_read_input_token_cost_above_272k_tokens": 1.1e-07, "input_cost_per_token_above_272k_tokens": 2.2e-06, "output_cost_per_token_above_272k_tokens": 8.25e-06}, "model_info": {"max_input_tokens": 922000, "max_output_tokens": 128000, "mode": "responses", "supports_function_calling": true, "supports_max_reasoning_effort": true, "supports_none_reasoning_effort": true, "supports_prompt_cache_breakpoint": true, "supports_prompt_caching": true, "supports_reasoning": true, "supports_response_schema": true, "supports_tool_choice": true, "supports_vision": true, "supports_xhigh_reasoning_effort": true}},
+              {"model_name": "glm-5.3", "litellm_params": {"model": "bedrock/converse/global.zai.glm-5.3", "aws_region_name": "${BedrockRegion}", "input_cost_per_token": 1.68e-06, "output_cost_per_token": 5.28e-06, "cache_read_input_token_cost": 3.12e-07, "cache_creation_input_token_cost": 2.1e-06, "cache_control_injection_points": [{"role": "system", "location": "message"}, {"index": -1, "location": "message"}]}, "model_info": {"max_input_tokens": 1000000, "max_output_tokens": 128000, "max_tokens": 128000, "mode": "chat", "supports_function_calling": true, "supports_native_structured_output": true, "supports_prompt_caching": true, "supports_reasoning": true, "supports_response_schema": true, "supports_system_messages": true, "supports_tool_choice": true}},
+              {"model_name": "kimi-k3", "litellm_params": {"model": "bedrock/converse/global.moonshotai.kimi-k3", "aws_region_name": "${BedrockRegion}", "input_cost_per_token": 3e-06, "output_cost_per_token": 1.5e-05, "cache_read_input_token_cost": 3e-07, "cache_creation_input_token_cost": 3.75e-06}, "model_info": {"max_input_tokens": 1000000, "max_output_tokens": 131072, "max_tokens": 131072, "mode": "chat", "supports_function_calling": true, "supports_reasoning": true, "supports_response_schema": true, "supports_system_messages": true, "supports_tool_choice": true, "supports_vision": true}},
+              {"model_name": "cohere.embed-v4", "litellm_params": {"model": "bedrock/global.cohere.embed-v4:0", "aws_region_name": "${BedrockRegion}", "input_cost_per_token": 1.2e-07, "output_cost_per_token": 0.0}, "model_info": {"max_input_tokens": 128000, "max_tokens": 128000, "mode": "embedding", "supports_embedding_image_input": true}}
+              ]
+            }
+          }
+        - BedrockRegion: !If [BedrockInStackRegion, !Ref "AWS::Region", !Ref BedrockRegion]
+          BedrockMantleRegion: !Ref BedrockMantleRegion
 
   # ============================================================================
   # SECTION 10.1: GA HTTPS RESOURCES (Certificate + Listener + Route)
@@ -3849,8 +4097,10 @@ Resources:
           metadata:
             name: eg
             namespace: envoy-gateway-system
-            annotations:
-              cert-manager.io/cluster-issuer: letsencrypt-gateway
+            # NOTE: no cert-manager.io/cluster-issuer annotation (gateway-shim):
+            # the listeners have no hostname, so the shim has nothing to issue,
+            # and a shim-managed Secret would fight the explicit ga-cert
+            # Certificate (GAHttpsSetup). Same as CloudFormation/CloudNativeFormation.yaml.
           spec:
             gatewayClassName: !Sub "cnf-${EnvironmentId}-eg"
             infrastructure:
@@ -3876,8 +4126,6 @@ Resources:
                   certificateRefs:
                     - kind: Secret
                       name: ga-https-cert
-                    - kind: Secret
-                      name: eg-https-cert
         # --- ClientTrafficPolicy for HTTP/2 ---
         - apiVersion: gateway.envoyproxy.io/v1alpha1
           kind: ClientTrafficPolicy
@@ -3904,128 +4152,16 @@ Resources:
                 requestReceivedTimeout: 0s
 
   # ============================================================================
-  # SECTION 11: COGNITO OIDC - SecurityPolicy (EnvoyGateway)
+  # SECTION 11: POST-DEPLOY NLB HEALTH CHECK
   # ============================================================================
 
-  # Lambda to update Cognito callback URLs and create SecurityPolicy
-  CognitoSecretFunction:
-    Type: AWS::Lambda::Function
-    DependsOn: QuotaCheck
-    Properties:
-      FunctionName: !Sub "${ProjectName}${EnvironmentId}-cognito-setup"
-      Runtime: python3.12
-      Handler: index.handler
-      Timeout: 300
-      MemorySize: 256
-      Role: !GetAtt KubectlLambdaRole.Arn
-      Code:
-        ZipFile: |
-          import base64,json,logging,tempfile,urllib3,boto3
-          from botocore.signers import RequestSigner
-          L=logging.getLogger();L.setLevel(logging.INFO)
-          def send_cfn(event,ctx,status,data=None,reason=None,pid=None):
-            body=json.dumps({"Status":status,"Reason":reason or f"Logs: {ctx.log_stream_name}","PhysicalResourceId":pid or event.get("PhysicalResourceId",ctx.log_stream_name),"StackId":event["StackId"],"RequestId":event["RequestId"],"LogicalResourceId":event["LogicalResourceId"],"Data":data or{}})
-            urllib3.PoolManager().request("PUT",event["ResponseURL"],body=body.encode(),headers={"Content-Type":""})
-          def get_token(sess,cluster,region):
-            sts=sess.client("sts",region_name=region);si=sts.meta.service_model.service_id
-            sg=RequestSigner(si,region,"sts","v4",sess.get_credentials(),sess.events)
-            p={"method":"GET","url":f"https://sts.{region}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15","body":{},"headers":{"x-k8s-aws-id":cluster},"context":{}}
-            u=sg.generate_presigned_url(p,region_name=region,expires_in=60,operation_name="")
-            return "k8s-aws-v1."+base64.urlsafe_b64encode(u.encode()).decode().rstrip("=")
-          def k8s_apply(http,ep,token,m):
-            av=m.get("apiVersion","");kind=m.get("kind","");name=m["metadata"]["name"];ns=m["metadata"].get("namespace")
-            PLURALS={"SecurityPolicy":"securitypolicies","Secret":"secrets","HTTPRoute":"httproutes"}
-            pl=PLURALS.get(kind,kind.lower()+"s")
-            px=f"apis/{av}" if "/" in av else f"api/{av}"
-            p=f"/{px}/namespaces/{ns}/{pl}" if ns else f"/{px}/{pl}"
-            hd={"Authorization":f"Bearer {token}","Content-Type":"application/json","Accept":"application/json"}
-            b=json.dumps(m).encode()
-            r=http.request("POST",f"{ep}{p}",headers=hd,body=b)
-            if r.status==409:
-              hd["Content-Type"]="application/merge-patch+json"
-              r=http.request("PATCH",f"{ep}{p}/{name}",headers=hd,body=b)
-            L.info(f"k8s_apply {kind}/{name}: {r.status}")
-            return r.status
-          def handler(event,ctx):
-            L.info(json.dumps(event,default=str))
-            rt=event["RequestType"];props=event["ResourceProperties"]
-            if rt=="Delete":
-              send_cfn(event,ctx,"SUCCESS",pid="cognito-setup");return
-            try:
-              region=props.get("Region",boto3.session.Session().region_name)
-              pool_id=props["UserPoolId"];client_id=props["ClientId"]
-              cluster=props["ClusterName"];ga_dns=props.get("GADualStackDns","")
-              app_root=props.get("AppRootPath","/app")
-              gw_ns=props.get("GatewayNamespace","envoy-gateway-system")
-              sess=boto3.Session(region_name=region)
-              cog=sess.client("cognito-idp")
-              # Get client secret
-              resp=cog.describe_user_pool_client(UserPoolId=pool_id,ClientId=client_id)
-              secret=resp["UserPoolClient"].get("ClientSecret","")
-              issuer=f"https://cognito-idp.{region}.amazonaws.com/{pool_id}"
-              # Update callback URLs
-              callbacks=[];logouts=[]
-              cf_domain=props.get("CloudFrontDomain","")
-              for d in [cf_domain,ga_dns]:
-                if d:
-                  callbacks.append(f"https://{d}{app_root}/auth/oidc/callback")
-                  logouts.append(f"https://{d}{app_root}/auth/oidc/logout")
-              if not callbacks:
-                callbacks=["https://localhost"+app_root+"/auth/oidc/callback"];logouts=["https://localhost"+app_root+"/auth/oidc/logout"]
-              L.info(f"Updating Cognito callbacks: {callbacks}")
-              cog.update_user_pool_client(UserPoolId=pool_id,ClientId=client_id,
-                CallbackURLs=callbacks,LogoutURLs=logouts,
-                AllowedOAuthFlows=["code"],AllowedOAuthFlowsUserPoolClient=True,
-                AllowedOAuthScopes=["openid","profile","email"],
-                SupportedIdentityProviders=["COGNITO"],
-                ExplicitAuthFlows=["ALLOW_USER_AUTH","ALLOW_USER_SRP_AUTH","ALLOW_REFRESH_TOKEN_AUTH"])
-              # --- Create K8s resources for SecurityPolicy ---
-              if cluster:
-                eks=sess.client("eks");ci=eks.describe_cluster(name=cluster)["cluster"]
-                ep=ci["endpoint"];ca=ci["certificateAuthority"]["data"]
-                tf=tempfile.NamedTemporaryFile(delete=False,suffix=".crt")
-                tf.write(base64.b64decode(ca));tf.flush();tf.close()
-                token=get_token(sess,cluster,region)
-                http=urllib3.PoolManager(cert_reqs="CERT_REQUIRED",ca_certs=tf.name)
-                # K8s Secret with Cognito client secret
-                k8s_apply(http,ep,token,{"apiVersion":"v1","kind":"Secret","metadata":{"name":"cognito-oidc-secret","namespace":gw_ns},"type":"Opaque","data":{"client-secret":base64.b64encode(secret.encode()).decode()}})
-                # --- GA /apis/v1/: scoped HTTPRoute + SecurityPolicy ---
-                if ga_dns:
-                  k8s_apply(http,ep,token,{"apiVersion":"gateway.networking.k8s.io/v1","kind":"HTTPRoute","metadata":{"name":"apis-v1-ga","namespace":gw_ns},"spec":{"parentRefs":[{"name":"eg","namespace":gw_ns,"sectionName":"https"}],"hostnames":[ga_dns],"rules":[{"matches":[{"path":{"type":"PathPrefix","value":"/apis/v1/"}}]}]}})
-                  k8s_apply(http,ep,token,{"apiVersion":"gateway.envoyproxy.io/v1alpha1","kind":"SecurityPolicy","metadata":{"name":"cognito-oidc-apis-v1","namespace":gw_ns},"spec":{"targetRefs":[{"group":"gateway.networking.k8s.io","kind":"HTTPRoute","name":"apis-v1-ga"}],"oidc":{"provider":{"issuer":issuer},"clientID":client_id,"clientSecret":{"group":"","kind":"Secret","name":"cognito-oidc-secret"},"redirectURL":f"https://{ga_dns}/apis/v1{app_root}/auth/oidc/callback","scopes":["openid","profile","email"],"forwardAccessToken":True}}})
-                  L.info("SecurityPolicy cognito-oidc-apis-v1 applied")
-              send_cfn(event,ctx,"SUCCESS",data={"CognitoIssuer":issuer,"ClientSecret":secret},pid="cognito-setup")
-            except Exception as e:
-              L.exception("fail");send_cfn(event,ctx,"FAILED",reason=str(e)[:256])
-
-  CognitoOidcSetup:
-    Type: Custom::CognitoSetup
-    DependsOn:
-      - K8sAppResources
-      - CognitoUserPoolClient
-      - GAHttpsSetup
-    Properties:
-      ServiceToken: !GetAtt CognitoSecretFunction.Arn
-      ClusterName: !Ref EksCluster
-      Region: !Ref "AWS::Region"
-      UserPoolId: !Ref CognitoUserPool
-      ClientId: !Ref CognitoUserPoolClient
-      CloudFrontDomain: !GetAtt CloudFrontDistribution.DomainName
-      GADualStackDns: !GetAtt GlobalAccelerator.DualStackDnsName
-      AppRootPath: !Ref AppRootPath
-      GatewayNamespace: envoy-gateway-system
-
-  # ============================================================================
-  # SECTION 12: POST-DEPLOY NLB HEALTH CHECK
-  # ============================================================================
-
-  # Ensures NLB port 80 listener exists after all Gateway updates.
-  # EKS Auto Mode's LB controller can lose listeners during Gateway reconcile.
+  # Ensures the NLB port 80 listener (HTTP-01 renewals of the GA certificate)
+  # exists after all Gateway updates: EKS Auto Mode's LB controller can lose
+  # listeners during a Gateway reconcile.
   NlbHealthCheck:
     Type: Custom::NlbHealthCheck
     DependsOn:
-      - HelmDeploy
-      - CognitoOidcSetup
+      - LiteLLMDeploy
     Properties:
       ServiceToken: !GetAtt NlbLookupFunction.Arn
       ClusterName: !Ref EksCluster
@@ -4034,7 +4170,6 @@ Resources:
       NlbArn: !GetAtt NlbLookup.NlbArn
       NlbDns: !GetAtt NlbLookup.NlbDns
       RequiredPort: 80
-      CloudFrontUrl: !Sub "http://${CloudFrontDistribution.DomainName}/health/readiness"
 
 # ==============================================================================
 # OUTPUTS
@@ -4065,12 +4200,8 @@ Outputs:
     Value: !Ref CognitoUserPool
 
   CognitoUserPoolClientId:
-    Description: "Cognito App Client ID"
-    Value: !Ref CognitoUserPoolClient
-
-  CognitoUserPoolClientSecret:
-    Description: "Cognito App Client Secret"
-    Value: !GetAtt CognitoOidcSetup.ClientSecret
+    Description: "Cognito App Client ID of the LiteLLM SSO"
+    Value: !Ref LiteLLMCognitoClient
 
   CognitoAdminUsername:
     Description: "Cognito Admin Username"
@@ -4122,19 +4253,22 @@ Outputs:
     Description: "Aurora PostgreSQL Password"
     Value: !Sub "${ProjectName}${EnvironmentId}Pg2026!"
   LiteLLMApiServer:
-    Description: "LiteLLM API Server (GA)"
+    Description: >-
+      LiteLLM API base URL (Global Accelerator) - the ONLY endpoint that serves
+      model calls (OpenAI /v1/*, Anthropic /v1/messages, ...), with a virtual key.
     Value: !Sub "https://${GlobalAccelerator.DualStackDnsName}/"
   LiteLLMAdminUI:
-    Description: "LiteLLM Admin UI (CloudFront)"
+    Description: >-
+      LiteLLM admin UI (CloudFront, Cognito SSO). Model calls through CloudFront
+      are refused with 403 (edge_policy.py).
     Value: !Sub "https://${CloudFrontDistribution.DomainName}/ui/"
   LiteLLMMasterKey:
     Description: >-
-      LiteLLM master key (READ-ONLY). This key can only read usage/statistics
-      (/spend/*, /global/spend, /*/info, /models). It CANNOT call models or
-      create/modify/delete API keys - those return 403 via the custom_auth
-      hook. Safe to expose here: it is scope-restricted, so it is not a
-      privilege-escalation vector. Model access requires an SSO-issued admin
-      virtual key. Value mirrors the litellm-masterkey Secret exactly.
+      LiteLLM master key (READ-ONLY). GET statistics / info routes only; model
+      calls and every write (/key/generate, /model/new, ...) return 403
+      (access_policy.py), and it cannot sign in to the UI
+      (disable_env_credential_login). Model calls need a virtual key created in
+      the UI. Value mirrors the litellm-masterkey Secret exactly.
     Value: !Sub
       - "sk-cnf-${Guid}"
       - Guid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
