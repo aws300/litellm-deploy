@@ -1,6 +1,6 @@
 # CloudNativeFormationLitellm.yaml
 
-一份 CloudFormation 模板，一次点击部署完整的 LiteLLM 云原生栈：VPC(IPv6 双栈) + EKS(Auto Mode, 1.35) + EnvoyGateway + CloudFront + Global Accelerator + Cognito SSO + Aurora Postgres Serverless + ElastiCache Serverless(Valkey) + DynamoDB + LiteLLM **v1.106.6**（Helm chart `litellm-helm 1.106.6`）。最近一次在 `us-west-1`（只有 2 个可用区）部署验证通过（2026-10-29），此前在 `ap-northeast-2` / `ap-southeast-1` 验证过。
+一份 CloudFormation 模板，一次点击部署完整的 LiteLLM 云原生栈：VPC(IPv6 双栈) + EKS(Auto Mode, **1.37**，模板固定，不再是参数) + EnvoyGateway + CloudFront + Global Accelerator + Cognito SSO + Aurora Postgres Serverless + ElastiCache Serverless(Valkey) + DynamoDB + LiteLLM **v1.106.6**（Helm chart `litellm-helm 1.106.6`）。最近一次在 `us-west-1`（只有 2 个可用区）部署验证通过（2026-10-29），此前在 `ap-northeast-2` / `ap-southeast-1` 验证过。
 
 - **API 文档**（入口、认证、模型、接口、错误码、验证）：[API.md](API.md)
 - **端到端验证脚本**：`LITELLM_KEY=sk-... ./scripts/e2e-test.sh --stack <stack> --region <region>`
@@ -48,7 +48,6 @@
    - **ProjectName**: `litellm`
    - **EnvironmentId**: `sg`（1-12 位字母数字，用来给资源加后缀）
    - **VpcCidr**: `10.80.0.0/16`（默认，改成不冲突的 `/16` 即可）
-   - **EksVersion**: `1.35`
    - **BedrockRegion**: 留空（= Stack 所在 Region）；**BedrockMantleRegion**: `us-east-1`
    - **AdminRoleArn**（可选）: 如果希望某个 IAM Role 自动获得 EKS console 访问权，填它的 ARN；不填也没问题（后面可通过 Access Entry 添加）。**不要填部署 Stack 所用的身份**：EKS 已自动把集群创建者设为管理员，再建一条同主体的 access entry 会 `409 AlreadyExists` 导致整个 Stack 失败（2026-10-29 实测）
    - **Tags**（可选）: JSON 对象，例如 `{"Env":"prod","Team":"platform"}`
@@ -73,10 +72,11 @@ Stack 详情页 → **Outputs** 页签，重点看这几项（点右边小图标
 
 | Output Key | 用途 |
 |---|---|
-| `LiteLLMAdminUI` | `https://<cf-domain>/ui/` — 浏览器打开走 Cognito SSO 登录；**经 CloudFront 的模型调用一律 403** |
-| `LiteLLMApiServer` | `https://<ga-dns>/` — **唯一**的 API 端点（Global Accelerator 双栈），见 [API.md](API.md) |
+| `A1ApiUrlGlobalAccelerator` | `https://<ga-dns>` — API 端点（Global Accelerator 双栈，推荐给 API 客户端），见 [API.md](API.md) |
+| `A2ApiUrlCloudFront` | `https://<cf-domain>` — 同一套 API 经 CloudFront（浏览器前端同源调用；响应超时见参数 `CloudFrontOriginReadTimeout`） |
+| `A3AdminUI` | `https://<cf-domain>/ui/` — 浏览器打开走 Cognito SSO 登录 |
 | `CognitoAdminUsername` / `CognitoAdminPassword` | 首次 SSO 登录用，**密码只显示一次，立即保存！** |
-| `LiteLLMMasterKey` | 只读 master key，只能读统计信息，**不能调模型、不能建 key、不能登录 UI** |
+| `A4MasterKey` | 只读 master key，只能读统计信息，**不能调模型、不能建 key、不能登录 UI** |
 | `EksClusterName` | 用于 `kubectl` 连接 |
 | `AuroraEndpoint` / `ValkeyEndpoint` / `DynamoDBTableName` | 后端数据服务地址 |
 
@@ -86,7 +86,7 @@ Stack 详情页 → **Outputs** 页签，重点看这几项（点右边小图标
 
 Master key 是只读的（详见"安全模型"），要调模型必须先通过 SSO 登录 UI 后生成一个虚拟 key。
 
-1. 浏览器打开 `LiteLLMAdminUI` 的地址
+1. 浏览器打开 `A3AdminUI` 的地址
 2. 会被跳转到 Cognito 登录页
 3. 用户名填 Outputs 里的 `CognitoAdminUsername`（默认 `admin@example.aws`），密码填 `CognitoAdminPassword`
 4. 首次登录会要求改密码
@@ -99,7 +99,7 @@ Master key 是只读的（详见"安全模型"），要调模型必须先通过 
      - **Reset Budget**: 选 `monthly`
    - **Create Key**
 7. 弹窗显示 `sk-xxxxx...`，**复制并保存**（只显示一次）
-8. 用这个 key 调 `LiteLLMApiServer`（GA）的 `/v1/chat/completions`、`/v1/messages`、`/v1/responses`、`/v1/embeddings` 等，见 [API.md](API.md)。同一个 key 发到 CloudFront 域名会被 403 拒绝
+8. 用这个 key 调 `A1ApiUrlGlobalAccelerator`（GA）或 `A2ApiUrlCloudFront`（CloudFront）的 `/v1/chat/completions`、`/v1/messages`、`/v1/responses`、`/v1/embeddings` 等，见 [API.md](API.md)
 
 ---
 
@@ -118,8 +118,8 @@ CloudShell 已预装 `aws` CLI，只需要装 `kubectl`。
 CloudShell 只保留 `~` 目录持久化，把 kubectl 放到 `~/bin/` 即可长期使用。
 
 ```bash
-# 下载 EKS 官方 kubectl（1.35 集群装 1.35.x）
-curl -sSLO "https://s3.us-west-2.amazonaws.com/amazon-eks/1.35.0/2024-12-12/bin/linux/amd64/kubectl"
+# 下载 kubectl（1.37 集群装 1.36–1.38 之间的版本）
+curl -sSLO "https://dl.k8s.io/release/v1.37.0/bin/linux/amd64/kubectl"
 chmod +x kubectl
 mkdir -p ~/bin
 mv kubectl ~/bin/
@@ -220,6 +220,7 @@ kubectl -n litellm exec -it deploy/litellm -- env | grep -E 'PROXY|COGNITO|CLOUD
 
 - **模板 >51 KB 必须走 S3 URL**，Console 不支持粘贴上传本地文件到 CloudFormation 直接使用（会被截断）。
 - **`Preserve successfully provisioned resources`** 强烈推荐：出错时保留资源，可以直接进 CloudWatch 看 Lambda / kubectl 日志。改完模板后 **Update stack**，或先 Delete stack 再重建。
+- **EKS 版本固定为 1.37**（模板里不再有 `EksVersion` 参数）。用旧模板（1.33–1.35）建的 Stack 不能直接 Update 到这个模板：EKS 每次只能升一个小版本，1.35 → 1.37 的 Update 会失败。先在 EKS 控制台把集群逐级升到 1.36、1.37（每级约 10 分钟），再用新模板 Update，或删除重建。
 - **不要通过 Console `Update stack` 修改 EKS `ComputeConfig` / `NodePools` 字段**：Karpenter Auto Mode 的 NodeClass/NodePool 是通过自定义资源应用的，改这些字段之前先 `kubectl get nodepool` 观察，避免节点池被强制重建。
 - **默认 5 个 NodePool**：`cpu-system`、`cpu` (arm64 通用)、`cpu-large` (arm64 大机型，tainted)、`cpu-general` (x86, tainted)、`gpu` (g6e.2xlarge, tainted)。LiteLLM 只用 arm64 `cpu` 池。
 - **`g6e.2xlarge` 在 ap-southeast-1 不可用**：只影响 GPU pool，LiteLLM 是纯 CPU 部署，不影响生产。
@@ -251,18 +252,18 @@ kubectl -n litellm exec -it deploy/litellm -- env | grep -E 'PROXY|COGNITO|CLOUD
   - ❌ 所有写操作（`/key/generate`、`/user/new`、`/model/new` …）→ 403
   - ❌ 不能当 UI 密码登录（`disable_env_credential_login: true`），UI 只能走 Cognito SSO
 - **每个 key 必须带预算**（`key_generation_settings`），花费按 key / 团队统计；Spend Log 不保存提示词与回复（`store_prompts_in_spend_logs: false`）。
-- **API 只走 GA，不走 CloudFront**：Envoy 在两条 HTTPRoute 上给请求打 `X-LiteLLM-Edge` 头（`set`，无法伪造），`edge_policy.py` 用 LiteLLM 自己的 `RouteChecks.is_llm_api_route` 判断，凡是经 CloudFront 的模型调用（含 `/chat/completions` 等别名、透传、MCP）一律 403；UI、SSO、管理接口和 `GET /v1/models` 不受影响。
+- **两个域名同一套 API**：GA 与 CloudFront 后面是同一个 LiteLLM、同一套认证（前端与 UI 同源调用 CloudFront，API 客户端用 GA）。CloudFront 对 API 前缀一律不缓存（`CachingDisabled`），只缓存 UI 静态内容，缓存键含 `Host`。
 - **模型列表**写死在模板 `LiteLLMDeploy.Properties.LiteLLMValues` 里（`store_model_in_db: false`，无 `bedrock/*` 通配），与 `litellm-model-discovery` 给 base 选出的 11 个 Bedrock 模型相同：Claude opus/sonnet/haiku 5.5、GPT-6 astra/sol/luna、GPT-6.1 sol/terra、GLM 5.3、Kimi K3、Cohere Embed v4。
 
-master key 仍然需要存在（它给 SSO 的 UI 会话 JWT 签名），由 StackId 的 GUID 派生，每个 Stack 不同；因为只读，可以放在 Outputs 里。两个策略模块依赖 LiteLLM 内部函数，升级镜像后跑一遍 `scripts/e2e-test.sh`。
+master key 仍然需要存在（它给 SSO 的 UI 会话 JWT 签名），由 StackId 的 GUID 派生，每个 Stack 不同；因为只读，可以放在 Outputs 里。策略模块 access_policy.py 依赖 LiteLLM 内部函数，升级镜像后跑一遍 `scripts/e2e-test.sh`。
 
 ---
 
 ## 六、架构速记
 
 - **入口两条路，全链路没有公网负载均衡器**（NLB、ALB 都是 `internal`）：
-  - CloudFront (`.cloudfront.net`) → VPC Origin → 内部 ALB → EnvoyGateway → LiteLLM（浏览器 UI 与 SSO 回调；模型调用 403）
-  - Global Accelerator (`.awsglobalaccelerator.com`) → 内部 NLB → EnvoyGateway → LiteLLM（API 客户端，唯一的模型调用入口）
+  - CloudFront (`.cloudfront.net`) → VPC Origin → 内部 ALB → EnvoyGateway → LiteLLM（UI、SSO 回调、浏览器前端调用的 API）
+  - Global Accelerator (`.awsglobalaccelerator.com`) → 内部 NLB → EnvoyGateway → LiteLLM（API 客户端）
 - **认证**：UI 走 LiteLLM 的 Cognito SSO（Cognito 组 `admin` → `proxy_admin`）；API 用 UI 里创建的虚拟 key
 - **存储**：Aurora Postgres（LiteLLM key/spend 元数据）、Valkey（rate limit）、DynamoDB（会话消息）、EFS（可选共享卷）
 - **计算**：EKS Auto Mode + Karpenter，纯 arm64 (m8g) 节点，1 min 弹性

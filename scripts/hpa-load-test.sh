@@ -21,7 +21,7 @@ DURATION=${2:-6m}
 WATCH_AFTER=${3:-1500}
 NS=litellm
 
-cleanup() { kubectl -n "$NS" delete job litellm-load configmap litellm-load --ignore-not-found >/dev/null; }
+cleanup() { kubectl -n "$NS" delete job/litellm-load configmap/litellm-load --ignore-not-found >/dev/null; }
 trap cleanup EXIT
 cleanup
 

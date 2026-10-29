@@ -1,12 +1,12 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   CloudNativeFormation LiteLLM - one-click LiteLLM v1.106.6 stack.
-  VPC (IPv6 dual-stack), EKS (Auto Mode), EnvoyGateway behind an internal NLB
-  (Global Accelerator, API) and an internal ALB (CloudFront VPC Origin, admin UI);
-  no load balancer has a public IP. Cognito SSO, Aurora PostgreSQL Serverless v2,
+  VPC (IPv6 dual-stack), EKS 1.37 (Auto Mode), EnvoyGateway behind an internal
+  NLB (Global Accelerator) and an internal ALB (CloudFront VPC Origin); both serve
+  the API and the admin UI, and no load balancer has a public IP. Cognito SSO, Aurora PostgreSQL Serverless v2,
   ElastiCache Serverless (Valkey), DynamoDB, EFS. Models: Bedrock Claude 5.5 /
-  GPT-6 / GLM / Kimi / Cohere embed, virtual keys only (read-only master key),
-  no model calls through CloudFront. Validated in us-west-1 (2 AZs).
+  GPT-6 / GLM / Kimi / Cohere embed, virtual keys only (read-only master key).
+  Validated in us-east-1 and us-west-1 (2 AZs).
   Upload this single file to S3 and deploy.
 
 # ==============================================================================
@@ -25,10 +25,6 @@ Metadata:
         Parameters:
           - VpcCidr
       - Label:
-          default: "EKS Configuration"
-        Parameters:
-          - EksVersion
-      - Label:
           default: "EnvoyGateway"
         Parameters:
           - EnvoyGatewayVersion
@@ -37,6 +33,10 @@ Metadata:
         Parameters:
           - BedrockRegion
           - BedrockMantleRegion
+      - Label:
+          default: "CloudFront"
+        Parameters:
+          - CloudFrontOriginReadTimeout
       - Label:
           default: "Resource Tags"
         Parameters:
@@ -48,14 +48,14 @@ Metadata:
         default: "Unique Environment ID (e.g. 001)"
       VpcCidr:
         default: "VPC IPv4 CIDR"
-      EksVersion:
-        default: "Kubernetes Version"
       EnvoyGatewayVersion:
         default: "EnvoyGateway Version"
       BedrockRegion:
         default: "Bedrock runtime region (empty = this region)"
       BedrockMantleRegion:
         default: "bedrock-mantle region (GPT-6)"
+      CloudFrontOriginReadTimeout:
+        default: "CloudFront origin response timeout (s)"
       Tags:
         default: "Resource Tags (JSON)"
 
@@ -80,15 +80,21 @@ Parameters:
     Description: "VPC IPv4 CIDR block (/16)"
     Default: "10.80.0.0/16"
     AllowedPattern: '^[0-9]+\.[0-9]+\.[0-9]+\.0\/16$'
-  EksVersion:
-    Type: String
-    Description: "EKS Kubernetes version"
-    Default: "1.35"
-    AllowedValues: ["1.33", "1.34", "1.35"]
   EnvoyGatewayVersion:
     Type: String
     Description: "EnvoyGateway release version"
     Default: "v1.8.0"
+  CloudFrontOriginReadTimeout:
+    Type: Number
+    Description: >-
+      Seconds CloudFront waits for a response byte from LiteLLM (origin response
+      timeout). Model calls through CloudFront longer than this without a byte
+      (non-streaming, long outputs) get 504; streaming calls are fine. 60 is the
+      AWS default quota; up to 180 after raising Service Quotas > CloudFront >
+      "Response timeout per origin" (L-AECE9FA7) — the stack fails otherwise.
+    Default: 60
+    MinValue: 1
+    MaxValue: 180
   BedrockRegion:
     Type: String
     Description: >-
@@ -1040,7 +1046,9 @@ Resources:
       - S3Endpoint
     Properties:
       Name: !Sub "${ProjectName}${EnvironmentId}"
-      Version: !Ref EksVersion
+      # Pinned, not a parameter: the add-ons, NodePools and EnvoyGateway release
+      # here are validated against this version only (us-east-2, 2026-10-29).
+      Version: "1.37"
       RoleArn: !GetAtt EksClusterRole.Arn
       AccessConfig:
         AuthenticationMode: API
@@ -2832,7 +2840,9 @@ Resources:
   # key: one cache entry per domain, never a page cached for one hostname served
   # to another. A Host in the cache key is also always forwarded to the origin,
   # which Envoy needs to pick HTTPRoute litellm-cf.
-  #   static: /ui/_next/static/* — content-hashed file names, immutable; at least
+  #   static: /litellm-asset-prefix/_next/static/* — the UI's JS / CSS / fonts
+  #     (v1.106.6 serves them under that prefix, not under /ui/: the HTML
+  #     references 28 of them); content-hashed file names, immutable; at least
   #     1 day even though LiteLLM sends no Cache-Control.
   #   html: /ui, /ui/* — the UI pages; 5 min by default so an upgrade shows up
   #     quickly, honouring origin Cache-Control (MinTTL 0).
@@ -3024,7 +3034,10 @@ Resources:
             VpcOriginConfig:
               VpcOriginId: !GetAtt CloudFrontVpcOrigin.Id
               OriginKeepaliveTimeout: 60
-              OriginReadTimeout: 60
+              # Max seconds CloudFront waits for the first / next response byte:
+              # a non-streaming model call that takes longer gets a 504 on
+              # CloudFront (GA has no such limit). See the parameter.
+              OriginReadTimeout: !Ref CloudFrontOriginReadTimeout
             OriginCustomHeaders:
               - HeaderName: X-CloudFront-Secret
                 HeaderValue: !Sub "cnf-${EnvironmentId}-${AWS::AccountId}"
@@ -3032,8 +3045,8 @@ Resources:
         # the managed CachingDisabled policy (4135ea2d...) with all viewer headers,
         # cookies and query strings forwarded (AllViewer, 216adef6...). The API
         # prefixes are listed explicitly so a later change of the default cannot
-        # start caching them. Model calls through CloudFront are 403 anyway
-        # (edge_policy.py); the rest is the UI's management API, per-user data.
+        # start caching them: model calls and the UI's management API (per-user
+        # data) must always reach LiteLLM.
         # First match wins: the cached UI patterns come first.
         DefaultCacheBehavior:
           TargetOriginId: EnvoyGatewayNLB
@@ -3045,7 +3058,7 @@ Resources:
           ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
           Compress: true
         CacheBehaviors:
-          - PathPattern: "/ui/_next/static/*"
+          - PathPattern: "/litellm-asset-prefix/_next/static/*"
             TargetOriginId: EnvoyGatewayNLB
             ViewerProtocolPolicy: redirect-to-https
             AllowedMethods: [GET, HEAD]
@@ -3335,7 +3348,7 @@ Resources:
         # --- LiteLLM policy callbacks (litellm_settings.callbacks) ---
         # Mounted next to config.yaml (/etc/litellm/), where LiteLLM resolves
         # callback modules; imported while config.yaml is read, so the pod does
-        # not start if either fails to patch the pinned image's internals.
+        # not start if it fails to patch the pinned image's internals.
         #   access_policy.py — VERBATIM copy of base/scripts/litellm/access_policy.py
         #     (keep in sync, re-test on every image tag): the master key is
         #     read-only (GET statistics + UI login; model calls and writes such as
@@ -3343,9 +3356,6 @@ Resources:
         #     key and is attributed to it; GET /v1/models is public. Its
         #     *.svc.cluster.local URL allowance is inert here
         #     (no litellm_settings.user_url_allowed_hosts).
-        #   edge_policy.py — no model call through CloudFront: any LLM route of a
-        #     request stamped X-LiteLLM-Edge: cloudfront (HTTPRoute litellm-cf
-        #     below) or carrying CloudFront's X-CloudFront-Secret -> 403.
         - apiVersion: v1
           kind: ConfigMap
           metadata:
@@ -3498,111 +3508,12 @@ Resources:
 
 
               proxy_handler_instance = MasterKeyGuard()
-            edge_policy.py: |
-              """Edge policy of the litellm/ stack: model calls only through Global Accelerator.
-
-              The stack has two public entry points onto one Envoy Gateway, both private
-              behind it (no public load balancer):
-                - CloudFront -> VPC Origin -> internal ALB -> Envoy, HTTPRoute litellm-cf:
-                  the admin UI and its SSO login;
-                - Global Accelerator -> internal NLB -> Envoy, HTTPRoute litellm-ga: the API.
-              Envoy stamps every request with X-LiteLLM-Edge (a `set`, so a client cannot pick
-              the value): `cloudfront` on litellm-cf, `global-accelerator` on litellm-ga.
-              CloudFront also adds its origin header X-CloudFront-Secret to every request,
-              which a viewer cannot remove.
-
-              A request that came through CloudFront may not call a model: every LLM,
-              pass-through, MCP, agent and search route — LiteLLM's own
-              RouteChecks.is_llm_api_route, the classification its key permissions use —
-              answers 403 whatever the key, before authentication. The model listing
-              (/v1/models, /models) stays: the UI reads it. Management routes (/key/*,
-              /user/*, /spend/*, /sso/*, /ui) are not LLM routes and keep working, so the UI
-              does; only its playground (it calls /chat/completions) is refused.
-
-              Not done at Envoy with a path list: LiteLLM serves hundreds of LLM routes and
-              aliases (/chat/completions, /engines/{model}/..., /openai/deployments/...,
-              /bedrock/*, /anthropic/*, /mcp, ...) and adds more every release; its own
-              classifier is the only list that keeps up.
-
-              Hooks the same auth builder as access_policy.py (load it after that one), plus
-              the pre-call hook as a second line on the model-call path. Coupled to the
-              pinned image like access_policy.py: the import fails loudly if internals move.
-              """
-
-              from litellm._logging import verbose_proxy_logger
-              from litellm.integrations.custom_logger import CustomLogger
-              from litellm.proxy._types import ProxyException
-              from litellm.proxy.auth import user_api_key_auth as _auth
-              from litellm.proxy.auth.route_checks import RouteChecks
-
-              EDGE_HEADER = "x-litellm-edge"
-              CLOUDFRONT_HEADER = "x-cloudfront-secret"
-              LISTING_ROUTES = frozenset({"/v1/models", "/models"})
-
-
-              def _via_cloudfront(headers) -> bool:
-                  if not headers:
-                      return False
-                  lower = {str(k).lower(): v for k, v in dict(headers).items()}
-                  return str(lower.get(EDGE_HEADER, "")).lower() == "cloudfront" or bool(lower.get(CLOUDFRONT_HEADER))
-
-
-              def _deny(route: str) -> ProxyException:
-                  return ProxyException(
-                      message=(
-                          f"model calls are not served through CloudFront ({route}). "
-                          "Call the Global Accelerator endpoint (stack output LiteLLMApiServer)."
-                      ),
-                      type="auth_error",
-                      param="api_key",
-                      code=403,
-                  )
-
-
-              def _check(request) -> None:
-                  if request is None or not _via_cloudfront(getattr(request, "headers", None)):
-                      return
-                  route = _auth.get_request_route(request=request)
-                  if route not in LISTING_ROUTES and RouteChecks.is_llm_api_route(route=route):
-                      raise _deny(route)
-
-
-              # v1.106.0 renamed the builder to user_api_key_auth_builder and kept
-              # _user_api_key_auth_builder as an unused alias: wrap the real one, point both
-              # names at the wrapper (as access_policy.py does, whose wrapper this wraps).
-              _BUILDER_NAMES = ("user_api_key_auth_builder", "_user_api_key_auth_builder")
-              _builder = getattr(_auth, "user_api_key_auth_builder", None) or _auth._user_api_key_auth_builder
-              if not getattr(_builder, "_edge_policy", False):
-
-                  async def _edge_guarded_builder(*args, **kwargs):
-                      _check(kwargs.get("request", args[0] if args else None))
-                      return await _builder(*args, **kwargs)
-
-                  _edge_guarded_builder._edge_policy = True  # type: ignore[attr-defined]
-                  _edge_guarded_builder._access_policy = getattr(_builder, "_access_policy", False)  # type: ignore[attr-defined]
-                  for _name in _BUILDER_NAMES:
-                      if hasattr(_auth, _name):
-                          setattr(_auth, _name, _edge_guarded_builder)
-                  verbose_proxy_logger.warning("edge_policy: no model calls through CloudFront (header %s)", EDGE_HEADER)
-
-
-              class CloudFrontModelCallGuard(CustomLogger):
-                  """Second line of defence on the LLM call path itself."""
-
-                  async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
-                      request = (data or {}).get("proxy_server_request") or {}
-                      if _via_cloudfront(request.get("headers")):
-                          raise _deny(str(request.get("url") or call_type))
-                      return data
-
-
-              proxy_handler_instance = CloudFrontModelCallGuard()
-        # --- LiteLLM HTTPRoutes: CloudFront (UI/SSO) and GA (API) ---
-        # Both reach the same Service; X-LiteLLM-Edge records which edge a
-        # request came through (`set` overwrites any client-supplied value) and
-        # edge_policy.py refuses model calls stamped `cloudfront`. A request is
-        # matched by its Host: CloudFront forwards the viewer Host (origin
-        # request policy AllViewer), GA passes the TLS stream through to Envoy.
+        # --- LiteLLM HTTPRoutes: CloudFront and GA ---
+        # Both edges serve the whole proxy — API and admin UI — so a front end on
+        # either domain can call models (same-origin requests from the UI on
+        # CloudFront, API clients on GA). A request is matched by its Host:
+        # CloudFront forwards the viewer Host (origin request policy AllViewer),
+        # GA passes the TLS stream through to Envoy.
         - apiVersion: gateway.networking.k8s.io/v1
           kind: HTTPRoute
           metadata:
@@ -3619,12 +3530,6 @@ Resources:
                   - path:
                       type: PathPrefix
                       value: /
-                filters:
-                  - type: RequestHeaderModifier
-                    requestHeaderModifier:
-                      set:
-                        - name: X-LiteLLM-Edge
-                          value: cloudfront
                 backendRefs:
                   - name: litellm
                     port: 4000
@@ -3644,12 +3549,6 @@ Resources:
                   - path:
                       type: PathPrefix
                       value: /
-                filters:
-                  - type: RequestHeaderModifier
-                    requestHeaderModifier:
-                      set:
-                        - name: X-LiteLLM-Edge
-                          value: global-accelerator
                 backendRefs:
                   - name: litellm
                     port: 4000
@@ -3676,11 +3575,6 @@ Resources:
                       path:
                         type: ReplaceFullPath
                         replaceFullPath: /ui/chat.html
-                  - type: RequestHeaderModifier
-                    requestHeaderModifier:
-                      set:
-                        - name: X-LiteLLM-Edge
-                          value: cloudfront
                 backendRefs:
                   - name: litellm
                     port: 4000
@@ -3953,8 +3847,8 @@ Resources:
       #   masterkeySecretName: the per-stack key of K8sAppResources; read-only
       #     through access_policy.py. disable_env_credential_login: it cannot be
       #     used as the UI password either — the UI is entered through Cognito SSO.
-      #   callbacks: access_policy (read-only master key) then edge_policy (no
-      #     model calls through CloudFront); order matters, both wrap one function.
+      #   callbacks: access_policy — the master key is read-only, so model calls
+      #     need a virtual key, through either edge (CloudFront or GA).
       #   store_model_in_db false: model_list below is the whole catalogue; the UI
       #     cannot add models.
       #   store_prompts_in_spend_logs false: as base/ — no prompt or response
@@ -4013,8 +3907,7 @@ Resources:
             ],
             "volumes": [{"name": "litellm-policy", "configMap": {"name": "litellm-policy"}}],
             "volumeMounts": [
-              {"name": "litellm-policy", "mountPath": "/etc/litellm/access_policy.py", "subPath": "access_policy.py", "readOnly": true},
-              {"name": "litellm-policy", "mountPath": "/etc/litellm/edge_policy.py", "subPath": "edge_policy.py", "readOnly": true}
+              {"name": "litellm-policy", "mountPath": "/etc/litellm/access_policy.py", "subPath": "access_policy.py", "readOnly": true}
             ],
             "envVars": {"LITELLM_MODE": "PRODUCTION", "LITELLM_LOG": "ERROR", "LITELLM_TELEMETRY": "False"},
             "proxy_config": {
@@ -4033,7 +3926,7 @@ Resources:
                 "global_max_parallel_requests": 500
               },
               "litellm_settings": {
-                "callbacks": ["access_policy.proxy_handler_instance", "edge_policy.proxy_handler_instance"],
+                "callbacks": ["access_policy.proxy_handler_instance"],
                 "drop_params": true,
                 "set_verbose": false,
                 "json_logs": true,
@@ -4175,6 +4068,32 @@ Resources:
 # OUTPUTS
 # ==============================================================================
 Outputs:
+  # Keys start with A1..A4 so the console (which sorts outputs by key) lists the
+  # entry points first: the two API base URLs, then the UI, then the master key.
+  A1ApiUrlGlobalAccelerator:
+    Description: >-
+      LiteLLM API base URL through Global Accelerator (OpenAI /v1/*, Anthropic
+      /v1/messages, ...; virtual key). Recommended for API clients: no response
+      timeout, anycast IPs.
+    Value: !Sub "https://${GlobalAccelerator.DualStackDnsName}"
+  A2ApiUrlCloudFront:
+    Description: >-
+      The same API through CloudFront (same-origin for the UI and browser front
+      ends). Uncached. A response byte must arrive within CloudFrontOriginReadTimeout.
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+  A3AdminUI:
+    Description: "LiteLLM admin UI (Cognito SSO; also served on the GA domain)"
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}/ui/"
+  A4MasterKey:
+    Description: >-
+      LiteLLM master key (READ-ONLY). GET statistics / info routes only; model
+      calls and every write (/key/generate, /model/new, ...) return 403
+      (access_policy.py), and it cannot sign in to the UI
+      (disable_env_credential_login). Model calls need a virtual key created in
+      the UI. Value mirrors the litellm-masterkey Secret exactly.
+    Value: !Sub
+      - "sk-cnf-${Guid}"
+      - Guid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
   StackName:
     Description: "Stack Name"
     Value: !Sub "${ProjectName}${EnvironmentId}"
@@ -4252,23 +4171,3 @@ Outputs:
   AuroraPassword:
     Description: "Aurora PostgreSQL Password"
     Value: !Sub "${ProjectName}${EnvironmentId}Pg2026!"
-  LiteLLMApiServer:
-    Description: >-
-      LiteLLM API base URL (Global Accelerator) - the ONLY endpoint that serves
-      model calls (OpenAI /v1/*, Anthropic /v1/messages, ...), with a virtual key.
-    Value: !Sub "https://${GlobalAccelerator.DualStackDnsName}/"
-  LiteLLMAdminUI:
-    Description: >-
-      LiteLLM admin UI (CloudFront, Cognito SSO). Model calls through CloudFront
-      are refused with 403 (edge_policy.py).
-    Value: !Sub "https://${CloudFrontDistribution.DomainName}/ui/"
-  LiteLLMMasterKey:
-    Description: >-
-      LiteLLM master key (READ-ONLY). GET statistics / info routes only; model
-      calls and every write (/key/generate, /model/new, ...) return 403
-      (access_policy.py), and it cannot sign in to the UI
-      (disable_env_credential_login). Model calls need a virtual key created in
-      the UI. Value mirrors the litellm-masterkey Secret exactly.
-    Value: !Sub
-      - "sk-cnf-${Guid}"
-      - Guid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]

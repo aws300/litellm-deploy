@@ -68,7 +68,6 @@
 | ProjectName | `litellm` | 1–20 位字母数字、字母开头。**建议全小写** |
 | EnvironmentId | `sg` | 1–12 位字母数字。**必须全小写**：它会拼进 Cognito 域名前缀 `cnf-<EnvironmentId>-<账号ID>`，Cognito 域名不允许大写 |
 | VpcCidr | `10.80.0.0/16` | 必须是 `/16`，且不能和已有 VPC / 对等网络冲突 |
-| EksVersion | `1.35` | 可选 1.33 / 1.34 / 1.35 |
 | EnvoyGatewayVersion | `v1.8.0` | 保持默认 |
 | BedrockRegion | 留空 | Bedrock 运行时 Region，留空 = Stack 所在 Region |
 | BedrockMantleRegion | `us-east-1` | GPT-6 走的 bedrock-mantle Region，只有 `us-east-1` 五个 GPT-6 都有 |
@@ -118,10 +117,11 @@ Stack 详情页 → **Outputs** 页签：
 
 | Output | 用途 |
 |---|---|
-| `LiteLLMAdminUI` | `https://<xxx>.cloudfront.net/ui/`，浏览器打开，走 Cognito SSO。**经 CloudFront 的模型调用一律 403** |
-| `LiteLLMApiServer` | `https://<xxx>.awsglobalaccelerator.com/`，**唯一**提供模型调用的端点（API 文档见 [../API.md](../API.md)） |
+| `A1ApiUrlGlobalAccelerator` | `https://<xxx>.awsglobalaccelerator.com`，API 端点（API 文档见 [../API.md](../API.md)） |
+| `A2ApiUrlCloudFront` | `https://<xxx>.cloudfront.net`，同一套 API 经 CloudFront（前端同源调用） |
+| `A3AdminUI` | `https://<xxx>.cloudfront.net/ui/`，浏览器打开，走 Cognito SSO |
 | `CognitoAdminUsername` / `CognitoAdminPassword` | 首次 SSO 登录账号（默认 `admin@example.aws`）。**密码请立即保存** |
-| `LiteLLMMasterKey` | 只读 master key：只能查统计，不能调模型、不能建 key |
+| `A4MasterKey` | 只读 master key：只能查统计，不能调模型、不能建 key |
 | `EksClusterName` | kubectl 连接用 |
 | `AuroraEndpoint` / `ValkeyEndpoint` / `DynamoDBTableName` | 后端数据服务地址 |
 
@@ -129,14 +129,14 @@ Stack 详情页 → **Outputs** 页签：
 
 ### 1.5 首次登录并生成 API Key
 
-1. 打开 `LiteLLMAdminUI`，会跳转到 Cognito 登录页
+1. 打开 `A3AdminUI`，会跳转到 Cognito 登录页
 2. 输入 `CognitoAdminUsername` / `CognitoAdminPassword` 登录
 3. 进入 LiteLLM Dashboard → 左侧 **Virtual Keys** → **+ Create New Key**
    - **Key Name**：如 `verify-key`
    - **Models**：留空表示全部模型
    - 展开 **Optional Settings**：**Max Budget (USD)** 填如 `100`，**Reset Budget** 选 `monthly`
    - **Create Key**
-4. 复制弹窗中的 `sk-...`（只显示一次），即可调用 `LiteLLMApiServer` 的 `/v1/chat/completions`、`/v1/messages` 等（见 [../API.md](../API.md)）。同一个 key 发到 CloudFront 域名会被 403 拒绝
+4. 复制弹窗中的 `sk-...`（只显示一次），即可调用 `A1ApiUrlGlobalAccelerator` 或 `A2ApiUrlCloudFront` 的 `/v1/chat/completions`、`/v1/messages` 等（见 [../API.md](../API.md)）
 
 ### 1.6 连接集群
 
@@ -451,7 +451,7 @@ LiteLLM Pod 通过 EKS Pod Identity 获得这个角色的临时凭证，**不需
 | 设置项 | 值 |
 |---|---|
 | Name | `litellm-sg` |
-| Kubernetes version | `1.35` |
+| Kubernetes version | `1.37` |
 | Cluster IAM role | `litellm-sg-EKSClusterRole` |
 | Cluster access → Bootstrap cluster administrator access | **Allow**（当前登录身份自动成为集群管理员） |
 | Cluster authentication mode | **EKS API** |
@@ -630,11 +630,11 @@ LiteLLM 用 Valkey 做多副本之间的限流/缓存共享，用 DynamoDB 存�
 kubectl version --client
 ```
 
-如果没有，或版本与集群相差超过 1 个小版本（集群 1.35 时 kubectl 需在 1.34–1.36 之间），下载一个放到 `~/bin`（CloudShell 只有 home 目录是持久化的）：
+如果没有，或版本与集群相差超过 1 个小版本（集群 1.37 时 kubectl 需在 1.36–1.38 之间），下载一个放到 `~/bin`（CloudShell 只有 home 目录是持久化的）：
 
 ```bash
 mkdir -p ~/bin
-curl -L -o ~/bin/kubectl https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl
+curl -L -o ~/bin/kubectl https://dl.k8s.io/release/v1.37.0/bin/linux/amd64/kubectl
 chmod +x ~/bin/kubectl
 echo 'export PATH=$HOME/bin:$PATH' >> ~/.bashrc && source ~/.bashrc
 kubectl version --client

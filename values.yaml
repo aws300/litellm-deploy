@@ -14,8 +14,7 @@
 #     --from-literal=GENERIC_CLIENT_SECRET=<cognito app client secret> \
 #     --from-literal=REDIS_PASSWORD=<valkey password>
 #   kubectl create configmap litellm-policy -n litellm \
-#     --from-file=../base/scripts/litellm/access_policy.py \
-#     --from-file=scripts/edge_policy.py
+#     --from-file=../base/scripts/litellm/access_policy.py
 #   helm upgrade --install litellm oci://docker.litellm.ai/berriai/litellm-helm \
 #     --version 1.106.6 -n litellm -f values.yaml
 #
@@ -27,12 +26,9 @@
 #   - model calls only with a virtual key: access_policy.py makes the master key
 #     read-only (GET statistics; model calls and writes such as /key/generate ->
 #     403) and disable_env_credential_login stops it signing in to the UI;
-#   - edge_policy.py refuses model calls that arrive through CloudFront
-#     (X-LiteLLM-Edge: cloudfront set by the HTTPRoute, or CloudFront's
-#     X-CloudFront-Secret origin header): the API is served on GA only;
 #   - every team / personal key must carry a budget (key_generation_settings);
 #   - no prompt / response text in the spend logs.
-# The two .py files are imported at startup and patch LiteLLM internals of this
+# access_policy.py is imported at startup and patch LiteLLM internals of this
 # exact version: re-run scripts/e2e-test.sh on every image tag change.
 #
 # The semantic auto-router and the cost-attribution hook of docs/litellm/ are
@@ -143,7 +139,7 @@ topologySpreadConstraints:
       matchLabels:
         app.kubernetes.io/name: litellm
 
-# The policy callbacks, next to config.yaml (where LiteLLM resolves them).
+# The policy callback, next to config.yaml (where LiteLLM resolves them).
 volumes:
   - name: litellm-policy
     configMap:
@@ -152,10 +148,6 @@ volumeMounts:
   - name: litellm-policy
     mountPath: /etc/litellm/access_policy.py
     subPath: access_policy.py
-    readOnly: true
-  - name: litellm-policy
-    mountPath: /etc/litellm/edge_policy.py
-    subPath: edge_policy.py
     readOnly: true
 
 # Secrets (GENERIC_CLIENT_SECRET, REDIS_PASSWORD) from Secret litellm-env.
@@ -203,10 +195,8 @@ proxy_config:
     max_parallel_requests: 100
     global_max_parallel_requests: 500
   litellm_settings:
-    # Order matters: both wrap the same auth function.
     callbacks:
       - access_policy.proxy_handler_instance
-      - edge_policy.proxy_handler_instance
     drop_params: true
     set_verbose: false
     json_logs: true

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # e2e-test.sh — end-to-end check of a deployed CloudNativeFormationLitellm stack.
 #
-# Why: the stack's guarantees are all "negative" ones that a healthy-looking
-# deployment does not prove — no load balancer with a public IP, model calls
-# served by Global Accelerator only (never CloudFront), the master key unable
-# to call models or mint keys. This script asserts each of them with real
+# Why: a healthy-looking deployment does not prove the stack's guarantees — no
+# load balancer with a public IP, the same API on both edges (Global
+# Accelerator and CloudFront), the master key unable to call models or mint
+# keys, nothing personal cached by CloudFront. This script asserts each of them with real
 # requests, plus one real call per model (they are billed: a few tokens each).
 #
 #   1. network : every load balancer in the stack VPC is `internal`; CloudFront
@@ -15,7 +15,8 @@
 #                /key/generate, and it cannot sign in to the UI.
 #   4. models  : every chat model via /v1/chat/completions, plus /v1/messages
 #                (Claude), /v1/responses (GPT-6) and /v1/embeddings (Cohere).
-#   5. CF      : the UI and the model list load; every model call is 403.
+#   5. CF      : the same API as GA: UI, model list, model calls (incl. a
+#                streamed one), the same 401 / 403 for no key / master key.
 #   6. cache   : UI behaviours key on Host and hit on a 2nd GET; the default and
 #                every API prefix use CachingDisabled and never hit.
 #
@@ -47,9 +48,9 @@ out() {
   aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
     --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
 }
-GA=$(out LiteLLMApiServer); GA=${GA%/}
-CF=$(out CloudFrontDomain); CF="https://$CF"
-MASTER=$(out LiteLLMMasterKey)
+GA=$(out A1ApiUrlGlobalAccelerator); GA=${GA%/}
+CF=$(out A2ApiUrlCloudFront); CF=${CF%/}
+MASTER=$(out A4MasterKey)
 VPC=$(out VpcId)
 KEY=${LITELLM_KEY:-}
 
@@ -58,7 +59,8 @@ CHAT_MODELS="claude-opus-5-5 claude-sonnet-5-5 claude-haiku-5-5 glm-5.3 kimi-k3 
 
 # req METHOD URL KEY [JSON] -> "<status> <body>" (body cut to 300 chars)
 req() {
-  local method=$1 url=$2 key=$3 body=${4:-} args=(-sS -m 180 -o /tmp/e2e.body -w '%{http_code}' -X "$method" "$url")
+  local method=$1 url=$2 key=$3 body=${4:-}
+  local args=(-sS -m 180 -o /tmp/e2e.body -w '%{http_code}' -X "$method" "$url")
   [[ -n $key ]] && args+=(-H "Authorization: Bearer $key")
   [[ -n $body ]] && args+=(-H 'Content-Type: application/json' -d "$body")
   local code; code=$(curl "${args[@]}" || echo 000)
@@ -66,7 +68,8 @@ req() {
 }
 expect() { # expect WANT_CODE LABEL RESULT [BODY_SUBSTRING]
   local want=$1 label=$2 res=$3 sub=${4:-}
-  if [[ ${res%% *} == "$want" && ( -z $sub || $res == *"$sub"* ) ]]; then ok "$label -> $want"
+  # The substring is searched in the whole body (res holds only its first 300 chars).
+  if [[ ${res%% *} == "$want" && ( -z $sub || $res == *"$sub"* || $(cat /tmp/e2e.body 2>/dev/null) == *"$sub"* ) ]]; then ok "$label -> $want"
   else bad "$label: want $want${sub:+ ($sub)}, got ${res:0:300}"; fi
 }
 chat() { printf '{"model":"%s","max_tokens":%s,"messages":[{"role":"user","content":"Reply with the single word: pong"}]}' "$1" "${2:-64}"; }
@@ -121,32 +124,40 @@ if [[ -z $KEY ]]; then skip "LITELLM_KEY not set"; else
     "$(req POST "$GA/v1/embeddings" "$KEY" '{"model":"cohere.embed-v4","input":["hello"]}')" '"embedding"'
 fi
 
-say "5. CloudFront $CF"
+say "5. CloudFront $CF (same API as GA)"
 expect 200 "GET /ui/" "$(req GET "$CF/ui/" "")"
 expect 200 "GET /v1/models" "$(req GET "$CF/v1/models" "")"
-expect 403 "chat with the master key" "$(req POST "$CF/v1/chat/completions" "$MASTER" "$(chat claude-haiku-5-5)")" "CloudFront"
+expect 403 "chat with the master key" "$(req POST "$CF/v1/chat/completions" "$MASTER" "$(chat claude-haiku-5-5)")" "read-only"
+expect 401 "chat without a key" "$(req POST "$CF/v1/chat/completions" "" "$(chat claude-haiku-5-5)")"
 if [[ -z $KEY ]]; then skip "keyed CloudFront checks: LITELLM_KEY not set"; else
-  for path in /v1/chat/completions /chat/completions /v1/messages /v1/responses /v1/embeddings /bedrock/model/global.anthropic.claude-haiku-5-5/converse; do
-    expect 403 "POST $path (virtual key)" "$(req POST "$CF$path" "$KEY" "$(chat claude-haiku-5-5)")" "CloudFront"
-  done
-  res=$(curl -sS -m 30 -o /tmp/e2e.body -w '%{http_code}' -X POST "$CF/v1/chat/completions" \
-    -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-    -H 'X-LiteLLM-Edge: global-accelerator' -d "$(chat claude-haiku-5-5)")
-  expect 403 "chat with a forged X-LiteLLM-Edge header" "$res $(head -c 200 /tmp/e2e.body)" "CloudFront"
-  expect 200 "GET /key/info (UI management API stays)" "$(req GET "$CF/key/info" "$KEY")"
+  expect 200 "chat claude-haiku-5-5" "$(req POST "$CF/v1/chat/completions" "$KEY" "$(chat claude-haiku-5-5)")" '"choices"'
+  expect 200 "chat gpt-6-luna" "$(req POST "$CF/v1/chat/completions" "$KEY" "$(chat gpt-6-luna)")" '"choices"'
+  expect 200 "/v1/messages claude-haiku-5-5" "$(req POST "$CF/v1/messages" "$KEY" "$(chat claude-haiku-5-5)")" '"content"'
+  expect 200 "/v1/responses gpt-6-luna" \
+    "$(req POST "$CF/v1/responses" "$KEY" '{"model":"gpt-6-luna","input":"Reply with the single word: pong"}')" '"output"'
+  expect 200 "/v1/embeddings cohere.embed-v4" \
+    "$(req POST "$CF/v1/embeddings" "$KEY" '{"model":"cohere.embed-v4","input":["hello"]}')" '"embedding"'
+  # Streaming through CloudFront: SSE chunks must arrive and end with [DONE].
+  sse=$(curl -sS -m 120 -N "$CF/v1/chat/completions" -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+    -d '{"model":"claude-haiku-5-5","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"Count from 1 to 5"}]}' || true)
+  if [[ $sse == *"data: [DONE]"* ]]; then ok "streaming chat ($(grep -c '^data:' <<<"$sse") SSE events)"; else bad "streaming chat: ${sse:0:300}"; fi
+  expect 200 "GET /key/info" "$(req GET "$CF/key/info" "$KEY")"
 fi
 
 say "6. CloudFront cache"
 xcache() { curl -sS -m 30 -o /dev/null -D - "$1" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-cache"{print $2}'; }
 pol=$(aws cloudfront get-distribution-config --id "$dist" --output json)
-for p in /ui /ui/* /ui/_next/static/*; do
+for p in /ui /ui/* /litellm-asset-prefix/_next/static/*; do
   cp=$(jq -r --arg p "$p" '.DistributionConfig.CacheBehaviors.Items[] | select(.PathPattern==$p) | .CachePolicyId' <<<"$pol")
   hk=$(aws cloudfront get-cache-policy --id "$cp" --query 'CachePolicy.CachePolicyConfig.ParametersInCacheKeyAndForwardedToOrigin.HeadersConfig.Headers.Items' --output text)
   if [[ $hk == *Host* ]]; then ok "$p cache key includes Host"; else bad "$p cache key headers: $hk"; fi
 done
-nocache=$(jq -r '[.DistributionConfig.DefaultCacheBehavior.CachePolicyId] + [.DistributionConfig.CacheBehaviors.Items[] | select(.PathPattern | startswith("/ui") | not) | .CachePolicyId] | unique | join(",")' <<<"$pol")
+# Every behaviour except the three cached UI ones above must be CachingDisabled.
+nocache=$(jq -r '[.DistributionConfig.DefaultCacheBehavior.CachePolicyId] + [.DistributionConfig.CacheBehaviors.Items[] | select((.PathPattern | startswith("/ui")) or (.PathPattern | startswith("/litellm-asset-prefix/")) | not) | .CachePolicyId] | unique | join(",")' <<<"$pol")
 if [[ $nocache == 4135ea2d-6df8-44a3-9df3-4b5a84be39ad ]]; then ok "default + API prefixes use CachingDisabled"; else bad "API behaviours use cache policies $nocache"; fi
-asset=$(curl -sS -m 30 "$CF/ui/" | grep -o '/ui/_next/static/[^"]*\.js' | head -1)
+# v1.106.6 serves the UI's assets under /litellm-asset-prefix/, not /ui/.
+asset=$(curl -sS -m 30 "$CF/ui/" | grep -o '/litellm-asset-prefix/_next/static/[^"]*\.js' | head -1 || true)
+[[ -n $asset ]] || bad "no /litellm-asset-prefix/_next/static/*.js referenced by /ui/"
 for u in "$CF/ui/" "$CF$asset"; do
   xcache "$u" >/dev/null; x=$(xcache "$u")
   if [[ $x == Hit* || $x == RefreshHit* ]]; then ok "${u#$CF} cached on 2nd GET ($x)"; else bad "${u#$CF} not cached on 2nd GET ($x)"; fi
