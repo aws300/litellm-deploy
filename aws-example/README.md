@@ -27,6 +27,9 @@
    - 浏览器打开 Stack Output `A3AdminUI`，用 Cognito 管理员（Output `CognitoAdminUsername` / `CognitoAdminPassword`，Cognito 组 `admin`）登录；
    - **Virtual Keys → + Create New Key**，Owned by 选 **You**（必须属于你这个管理员用户），填预算 → Create，复制 `sk-...`。
    - 没有归属用户的 key（"service account"）调这些管理接口会得到 `401 Only proxy admin can be used ...`；master key 在本栈是只读的，同样不行。
+   - **用 kubectl 直接生成（无需打开浏览器）**：`export LITELLM_ADMIN_KEY=$(./get-admin-key.sh)`。脚本在 LiteLLM Pod 里用 LiteLLM 自己的建 key 函数，
+     直接写数据库，为第一个 proxy_admin 用户创建 key（默认预算 $20 / 30 天）。前提：kubectl 指向栈的集群，且 Cognito 管理员**至少登录过一次 UI**
+     （首次登录才会建出 proxy_admin 用户）。用完可在 UI 的 Virtual Keys 里删除。
 5. **测试 key（`LITELLM_KEY`）**：任意普通虚拟 key 即可（也可以直接用管理员 key）。
 
 所有脚本从栈的 Outputs 读取地址，默认 `STACK=litellm-use1 REGION=us-east-1`，换环境只需覆盖这两个变量：
@@ -281,6 +284,7 @@ LITELLM_KEY=sk-... ./test.sh
 aws-example/
 ├── README.md               本文
 ├── lib.sh                  公共函数：读栈 Outputs、调用 LiteLLM 管理接口
+├── get-admin-key.sh        用 kubectl 生成管理员虚拟 key
 ├── 00-iam.sh               Pod 角色内联策略
 ├── 10-guardrail.sh         Bedrock Guardrails
 ├── 20-agentcore-agent.sh   AgentCore Runtime agent
