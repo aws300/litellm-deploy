@@ -3849,8 +3849,15 @@ Resources:
       #     used as the UI password either — the UI is entered through Cognito SSO.
       #   callbacks: access_policy — the master key is read-only, so model calls
       #     need a virtual key, through either edge (CloudFront or GA).
-      #   store_model_in_db false: model_list below is the whole catalogue; the UI
-      #     cannot add models.
+      #   store_model_in_db true + supported_db_objects: every pod reloads the
+      #     objects created through the UI / API (guardrails, vector stores,
+      #     agents, search tools, MCP servers, ...) from the DB every 30s. With
+      #     store_model_in_db false LiteLLM v1.106.6 reloads only search tools and
+      #     MCP servers, so a guardrail or agent added through the API exists on
+      #     the one pod that served the request and is silently skipped by the
+      #     others (found with aws-example/, 2026-10-30). `models` is NOT listed:
+      #     model_list below stays the whole catalogue; a model added in the UI is
+      #     stored but never served.
       #   store_prompts_in_spend_logs false: as base/ — no prompt or response
       #     text in the database.
       #   key_generation_settings: every team / personal key needs a budget.
@@ -3914,7 +3921,9 @@ Resources:
               "general_settings": {
                 "master_key": "os.environ/PROXY_MASTER_KEY",
                 "disable_env_credential_login": true,
-                "store_model_in_db": false,
+                "store_model_in_db": true,
+                "supported_db_objects": ["guardrails", "policies", "vector_stores", "vector_store_indexes", "agents",
+                                         "search_tools", "mcp", "prompts", "tools", "pass_through_endpoints"],
                 "allow_requests_on_db_unavailable": true,
                 "database_connection_pool_limit": 10,
                 "maximum_spend_logs_retention_period": "7d",

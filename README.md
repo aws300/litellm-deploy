@@ -3,6 +3,7 @@
 一份 CloudFormation 模板，一次点击部署完整的 LiteLLM 云原生栈：VPC(IPv6 双栈) + EKS(Auto Mode, **1.37**，模板固定，不再是参数) + EnvoyGateway + CloudFront + Global Accelerator + Cognito SSO + Aurora Postgres Serverless + ElastiCache Serverless(Valkey) + DynamoDB + LiteLLM **v1.106.6**（Helm chart `litellm-helm 1.106.6`）。最近一次在 `us-west-1`（只有 2 个可用区）部署验证通过（2026-10-29），此前在 `ap-northeast-2` / `ap-southeast-1` 验证过。
 
 - **API 文档**（入口、认证、模型、接口、错误码、验证）：[API.md](API.md)
+- **接入 AWS 生态（aws-example）**：Bedrock Guardrails、Bedrock AgentCore Agent、Web Search on Amazon Bedrock、Amazon S3 Vectors 的脚本与文档：[aws-example/README.md](aws-example/README.md)
 - **端到端验证脚本**：`LITELLM_KEY=sk-... ./scripts/e2e-test.sh --stack <stack> --region <region>`
 - 面向运维的纯控制台操作手册（一键部署 / 逐项手动创建、每个 IAM 角色的完整 JSON、一键卸载与逐个卸载）见 [docs/console-deployment.md](docs/console-deployment.md)。
 - 不经 CloudFormation、直接装到已有集群的同一套 Helm 配置：[values.yaml](values.yaml)。
@@ -253,7 +254,7 @@ kubectl -n litellm exec -it deploy/litellm -- env | grep -E 'PROXY|COGNITO|CLOUD
   - ❌ 不能当 UI 密码登录（`disable_env_credential_login: true`），UI 只能走 Cognito SSO
 - **每个 key 必须带预算**（`key_generation_settings`），花费按 key / 团队统计；Spend Log 不保存提示词与回复（`store_prompts_in_spend_logs: false`）。
 - **两个域名同一套 API**：GA 与 CloudFront 后面是同一个 LiteLLM、同一套认证（前端与 UI 同源调用 CloudFront，API 客户端用 GA）。CloudFront 对 API 前缀一律不缓存（`CachingDisabled`），只缓存 UI 静态内容，缓存键含 `Host`。
-- **模型列表**写死在模板 `LiteLLMDeploy.Properties.LiteLLMValues` 里（`store_model_in_db: false`，无 `bedrock/*` 通配），与 `litellm-model-discovery` 给 base 选出的 11 个 Bedrock 模型相同：Claude opus/sonnet/haiku 5.5、GPT-6 astra/sol/luna、GPT-6.1 sol/terra、GLM 5.3、Kimi K3、Cohere Embed v4。
+- **模型列表**写死在模板 `LiteLLMDeploy.Properties.LiteLLMValues` 里（`supported_db_objects` 不含 `models`，UI 里新增的模型不会生效；无 `bedrock/*` 通配），与 `litellm-model-discovery` 给 base 选出的 11 个 Bedrock 模型相同：Claude opus/sonnet/haiku 5.5、GPT-6 astra/sol/luna、GPT-6.1 sol/terra、GLM 5.3、Kimi K3、Cohere Embed v4。
 
 master key 仍然需要存在（它给 SSO 的 UI 会话 JWT 签名），由 StackId 的 GUID 派生，每个 Stack 不同；因为只读，可以放在 Outputs 里。策略模块 access_policy.py 依赖 LiteLLM 内部函数，升级镜像后跑一遍 `scripts/e2e-test.sh`。
 

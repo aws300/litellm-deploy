@@ -182,8 +182,13 @@ proxy_config:
     master_key: os.environ/PROXY_MASTER_KEY
     # The master key cannot be the UI password; the UI is entered through SSO.
     disable_env_credential_login: true
-    # model_list below is the whole catalogue; the UI cannot add models.
-    store_model_in_db: false
+    # Every pod reloads UI / API-created guardrails, vector stores, agents,
+    # search tools, MCP servers ... from the DB (with false, v1.106.6 reloads only
+    # search tools and MCP, so the others exist on one pod only). `models` is not
+    # listed: model_list below stays the whole catalogue.
+    store_model_in_db: true
+    supported_db_objects: [guardrails, policies, vector_stores, vector_store_indexes, agents,
+                           search_tools, mcp, prompts, tools, pass_through_endpoints]
     allow_requests_on_db_unavailable: true
     # Per worker: 4 x 10 x 30 pods = 1200 connections (Aurora MaxCapacity 8 ACU).
     database_connection_pool_limit: 10

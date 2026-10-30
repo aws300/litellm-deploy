@@ -73,7 +73,7 @@ export LITELLM_KEY=sk-...        # 虚拟 key
 
 ## 3. 模型
 
-与 `litellm-model-discovery`（`docker/litellm-model-discovery/configs/config.yaml`）为 base LiteLLM 选出的 Bedrock 模型完全相同：同名、同后端、同价格与能力（取自 base `/model/info`，2026-10-29）。模型列表固定在配置里（`store_model_in_db: false`），没有 `bedrock/*` 通配。
+与 `litellm-model-discovery`（`docker/litellm-model-discovery/configs/config.yaml`）为 base LiteLLM 选出的 Bedrock 模型完全相同：同名、同后端、同价格与能力（取自 base `/model/info`，2026-10-29）。模型列表固定在配置里（`store_model_in_db: true` 但 `supported_db_objects` 不含 `models`：UI 里新增的模型只入库、不生效），没有 `bedrock/*` 通配。UI / API 创建的护栏、向量库、Agent、搜索工具则每 30 秒同步到所有 Pod。
 
 | 模型名 | 后端 | 原生 API | 上下文 输入 / 输出 | 价格 $/1M token 输入 / 输出 |
 |---|---|---|---|---|
@@ -164,6 +164,10 @@ curl -s https://$GA/v1/embeddings -H "Authorization: Bearer $LITELLM_KEY" \
 ```bash
 curl -s https://$GA/key/info -H "Authorization: Bearer $LITELLM_KEY"   # 预算、已花费、可用模型
 ```
+
+### 4.7 AWS 生态（aws-example）
+
+护栏 `"guardrails": ["aws-example"]`、Agent `POST /a2a/aws-example`、搜索 `POST /v1/search/aws-example`、向量库 `POST /v1/vector_stores/<id>/search` 与聊天 `file_search`：接入脚本、调用示例和已知限制见 [aws-example/README.md](aws-example/README.md)。
 
 ## 5. 错误码
 
