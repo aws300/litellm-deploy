@@ -68,7 +68,7 @@
 | ProjectName | `litellm` | 1–20 位字母数字、字母开头。**建议全小写** |
 | EnvironmentId | `sg` | 1–12 位字母数字。**必须全小写**：它会拼进 Cognito 域名前缀 `cnf-<EnvironmentId>-<账号ID>`，Cognito 域名不允许大写 |
 | VpcCidr | `10.80.0.0/16` | 必须是 `/16`，且不能和已有 VPC / 对等网络冲突 |
-| EnvoyGatewayVersion | `v1.8.0` | 保持默认 |
+| EnvoyGatewayVersion | `v1.10.0` | 保持默认 |
 | BedrockRegion | 留空 | Bedrock 运行时 Region，留空 = Stack 所在 Region |
 | BedrockMantleRegion | `us-east-1` | GPT-6 走的 bedrock-mantle Region，只有 `us-east-1` 五个 GPT-6 都有 |
 | AdminRoleArn | 你平时登录控制台所用 IAM Role 的 ARN | 可留空。填了之后这个角色自动成为 EKS 集群管理员，省掉 3.3 节的授权步骤。**不要填部署 Stack 所用的身份**（它已自动是集群管理员，重复的 access entry 会 409 失败） |
@@ -696,11 +696,11 @@ kubectl get events -A --sort-by=.lastTimestamp | tail -30
 
 ### 4.1 安装 EnvoyGateway 控制器
 
-在 CloudShell 中执行（版本与模板一致：`v1.7.1`）：
+在 CloudShell 中执行（版本与模板一致：`v1.10.0`）：
 
 ```bash
 kubectl apply --server-side \
-  -f https://github.com/envoyproxy/gateway/releases/download/v1.7.1/install.yaml
+  -f https://github.com/envoyproxy/gateway/releases/download/v1.10.0/install.yaml
 
 kubectl wait -n envoy-gateway-system deployment/envoy-gateway \
   --for=condition=Available --timeout=5m
@@ -709,7 +709,7 @@ kubectl wait -n envoy-gateway-system deployment/envoy-gateway \
 `install.yaml` 会创建 `envoy-gateway-system` 命名空间、Gateway API CRD、Envoy Gateway CRD 和控制器 Deployment。`--server-side` 是必须的，CRD 体积超过客户端 apply 的注解大小上限。
 
 > 已经有 Helm 的环境也可以用和模板完全相同的方式安装：
-> `helm upgrade --install eg oci://docker.io/envoyproxy/gateway-helm --version v1.7.1 -n envoy-gateway-system --create-namespace`
+> `helm upgrade --install eg oci://docker.io/envoyproxy/gateway-helm --version v1.10.0 -n envoy-gateway-system --create-namespace`
 
 ### 4.2 创建 EnvoyProxy、GatewayClass 和 Gateway
 
@@ -840,7 +840,7 @@ LiteLLM 本身的 Helm 部署、HTTPRoute、超时策略等后续步骤见 [`../
 |---|---|---|---|
 | 1 | CloudShell | `kubectl delete -f eg-gateway.yaml` | **必须最先做**。删除 Gateway 会让 Auto Mode 回收它创建的内部 NLB；若直接删集群，NLB 和它的网卡会残留，第 9 步删 VPC 时卡住 |
 | 2 | EC2 → **Load Balancers** | 确认第 1 步的 NLB 已消失（约 2–5 分钟）；若还在，手动选中 → **Actions → Delete load balancer** | 名字通常以 `k8s-envoyga` 开头 |
-| 3 | CloudShell（可选） | `kubectl delete -f https://github.com/envoyproxy/gateway/releases/download/v1.7.1/install.yaml` | 卸载 EnvoyGateway 控制器；马上要删集群的话可跳过 |
+| 3 | CloudShell（可选） | `kubectl delete -f https://github.com/envoyproxy/gateway/releases/download/v1.10.0/install.yaml` | 卸载 EnvoyGateway 控制器；马上要删集群的话可跳过 |
 | 4 | EKS → 集群 → **Access** → **Pod Identity associations** | 逐个选中 → **Delete** | — |
 | 5 | EKS → **Clusters** | 选中集群 → **Delete** → 输入集群名确认 | 约 10 分钟。Auto Mode 拉起的 EC2 节点会随集群自动终止，到 EC2 → **Instances** 确认无残留 |
 | 6 | RDS → **Databases** | 先删实例（选中 writer 实例 → **Actions → Delete**），再删集群；按提示选择是否保留最终快照 | 若开启了删除保护，先 **Modify** 关闭 **Deletion protection** |
