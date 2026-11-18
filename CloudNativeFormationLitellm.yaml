@@ -2081,6 +2081,16 @@ Resources:
       UserPoolId: !Ref CognitoUserPool
       LambdaArn: !GetAtt CognitoPreTokenGenFunction.Arn
       Region: !Ref "AWS::Region"
+      # Re-asserted on every Create/Update. UpdateUserPool resets every setting it
+      # is not given, so these must match CognitoUserPool above. Listing them here
+      # also heals stacks whose pool an older version of this function reset
+      # (AllowAdminCreateUserOnly back to false, AutoVerifiedAttributes cleared):
+      # the changed properties make CloudFormation re-run the function on update.
+      Enforce:
+        AdminCreateUserConfig:
+          AllowAdminCreateUserOnly: true
+        AutoVerifiedAttributes:
+          - email
 
   CognitoLambdaConfigFunction:
     Type: AWS::Lambda::Function
@@ -2102,20 +2112,44 @@ Resources:
               "StackId":event["StackId"],"RequestId":event["RequestId"],
               "LogicalResourceId":event["LogicalResourceId"],"Data":{}})
             urllib3.PoolManager().request("PUT",event["ResponseURL"],body=body.encode(),headers={"Content-Type":""})
+          # UpdateUserPool RESETS every setting it is not passed to its default
+          # (e.g. AllowAdminCreateUserOnly -> false, AutoVerifiedAttributes -> []).
+          # Copy every updatable setting from DescribeUserPool and change only
+          # LambdaConfig (+ the explicit Enforce overrides).
+          UPDATABLE=("Policies","DeletionProtection","LambdaConfig","AutoVerifiedAttributes",
+            "SmsVerificationMessage","EmailVerificationMessage","EmailVerificationSubject",
+            "VerificationMessageTemplate","SmsAuthenticationMessage","UserAttributeUpdateSettings",
+            "MfaConfiguration","DeviceConfiguration","EmailConfiguration","SmsConfiguration",
+            "UserPoolTags","AdminCreateUserConfig","UserPoolAddOns","AccountRecoverySetting",
+            "PoolName","UserPoolTier")
+          def apply(cog,pool_id,lambda_arn,enforce,delete):
+            pool=cog.describe_user_pool(UserPoolId=pool_id)['UserPool']
+            args={k:pool[k] for k in UPDATABLE if k in pool}
+            # Deprecated twin of PasswordPolicy.TemporaryPasswordValidityDays;
+            # passing both is rejected.
+            args.get("AdminCreateUserConfig",{}).pop("UnusedAccountValidityDays",None)
+            lc=dict(args.get("LambdaConfig") or {})
+            lc.pop('PreTokenGeneration',None);lc.pop('PreTokenGenerationConfig',None)
+            if not delete:
+              lc['PreTokenGenerationConfig']={"LambdaArn":lambda_arn,"LambdaVersion":"V3_0"}
+              for k,v in (enforce or {}).items():
+                if isinstance(v,dict):args[k]={**(args.get(k) or {}),**v}
+                else:args[k]=v
+            args["LambdaConfig"]=lc
+            if "AdminCreateUserConfig" in args:
+              a=args["AdminCreateUserConfig"]
+              if isinstance(a.get("AllowAdminCreateUserOnly"),str):a["AllowAdminCreateUserOnly"]=a["AllowAdminCreateUserOnly"].lower()=="true"
+            cog.update_user_pool(UserPoolId=pool_id,**args)
+            after=cog.describe_user_pool(UserPoolId=pool_id)['UserPool']
+            L.info(f"pool {pool_id}: AllowAdminCreateUserOnly={after.get('AdminCreateUserConfig',{}).get('AllowAdminCreateUserOnly')} AutoVerified={after.get('AutoVerifiedAttributes')}")
+            return after
           def handler(event,ctx):
             L.info(json.dumps(event,default=str))
             props=event["ResourceProperties"]
             pool_id=props["UserPoolId"];region=props.get("Region",boto3.session.Session().region_name)
             cog=boto3.client("cognito-idp",region_name=region)
             try:
-              # Describe current pool to preserve existing settings
-              pool=cog.describe_user_pool(UserPoolId=pool_id)['UserPool']
-              lc=pool.get('LambdaConfig',{})
-              if event["RequestType"]=="Delete":
-                lc.pop('PreTokenGeneration',None);lc.pop('PreTokenGenerationConfig',None)
-              else:
-                lc['PreTokenGenerationConfig']={"LambdaArn":props["LambdaArn"],"LambdaVersion":"V3_0"}
-              cog.update_user_pool(UserPoolId=pool_id,LambdaConfig=lc)
+              apply(cog,pool_id,props["LambdaArn"],props.get("Enforce"),event["RequestType"]=="Delete")
               send_cfn(event,ctx,"SUCCESS")
             except Exception as e:
               L.exception("fail");send_cfn(event,ctx,"FAILED",reason=str(e)[:256])
