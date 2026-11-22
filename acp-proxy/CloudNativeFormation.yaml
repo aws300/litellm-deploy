@@ -2101,7 +2101,7 @@ Resources:
           RequireSymbols: true
           RequireUppercase: true
       AdminCreateUserConfig:
-        AllowAdminCreateUserOnly: false
+        AllowAdminCreateUserOnly: true
 
   CognitoUserPoolDomain:
     Type: AWS::Cognito::UserPoolDomain
