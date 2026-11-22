@@ -4200,11 +4200,12 @@ Resources:
   # (multi-replica membership / account sharding) and the Cognito pool.
 
   # Generated once, kept across stack updates; read by AcpProxyDeployFunction.
+  # No fixed Name: a deleted secret lingers (recovery window) under its name, so a
+  # fixed name would block re-creating a stack with the same EnvironmentId.
   AcpProxyAdminTokenSecret:
     Type: AWS::SecretsManager::Secret
     Condition: DeployAcpProxy
     Properties:
-      Name: !Sub "${ProjectName}${EnvironmentId}/acp-proxy/admin-token"
       Description: "acp-proxy admin API bearer token (ACP_ADMIN_TOKEN)"
       GenerateSecretString:
         PasswordLength: 48
@@ -4213,7 +4214,6 @@ Resources:
     Type: AWS::SecretsManager::Secret
     Condition: DeployAcpProxy
     Properties:
-      Name: !Sub "${ProjectName}${EnvironmentId}/acp-proxy/api-key"
       Description: "acp-proxy API key body; the key is sk-acp-<this value>"
       GenerateSecretString:
         PasswordLength: 40
@@ -4222,7 +4222,6 @@ Resources:
     Type: AWS::SecretsManager::Secret
     Condition: DeployAcpProxy
     Properties:
-      Name: !Sub "${ProjectName}${EnvironmentId}/acp-proxy/store-key"
       Description: "acp-proxy KP_SECRET_KEY (seals stored passwords, signs console cookies)"
       GenerateSecretString:
         PasswordLength: 64
@@ -4621,7 +4620,7 @@ Outputs:
     Value: !Sub "https://${CloudFrontDistribution.DomainName}/acp-proxy/"
   B3AcpProxyApiKey:
     Condition: DeployAcpProxy
-    Description: "acp-proxy API key (x-api-key / ANTHROPIC_AUTH_TOKEN); Secrets Manager <stack>/acp-proxy/api-key with the sk-acp- prefix"
+    Description: "acp-proxy API key (x-api-key / ANTHROPIC_AUTH_TOKEN) = sk-acp- + the AcpProxyApiKeySecret value"
     Value: !GetAtt AcpProxyDeploy.ApiKey
   B4AcpProxyAdminToken:
     Condition: DeployAcpProxy

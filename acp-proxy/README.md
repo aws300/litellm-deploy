@@ -89,12 +89,14 @@ aws s3 mb s3://$BUCKET --region $REGION 2>/dev/null
 aws s3 cp CloudNativeFormation.yaml s3://$BUCKET/ --region $REGION
 aws cloudformation create-stack --region $REGION --stack-name cnf-sg \
   --template-url https://$BUCKET.s3.$REGION.amazonaws.com/CloudNativeFormation.yaml \
-  --capabilities CAPABILITY_NAMED_IAM --on-failure DO_NOTHING \
+  --capabilities CAPABILITY_NAMED_IAM --disable-rollback \
   --parameters ParameterKey=ProjectName,ParameterValue=cnf ParameterKey=EnvironmentId,ParameterValue=sg01 \
                ParameterKey=DeployLiteLLM,ParameterValue=true ParameterKey=DeployAcpProxy,ParameterValue=true
 aws cloudformation wait stack-create-complete --region $REGION --stack-name cnf-sg
 aws cloudformation describe-stacks --region $REGION --stack-name cnf-sg --query 'Stacks[0].Outputs' --output table
 ```
+
+用 `--disable-rollback`（等价于 Console 的 *Preserve successfully provisioned resources*），**不要**用 `--on-failure DO_NOTHING`：后者建出来的 Stack 在 `CREATE_FAILED` 后不能 Update，只能删了重建；前者可以修好原因（例如把 GHCR 包设为 public）后直接 `aws cloudformation update-stack --use-previous-template ...` 重试失败的那一步。
 
 ### 步骤 4：Outputs
 
@@ -113,7 +115,7 @@ aws cloudformation describe-stacks --region $REGION --stack-name cnf-sg --query 
 | `EksClusterName` | 总有 | `kubectl` 连接用 |
 | `AuroraEndpoint` / `ValkeyEndpoint` / `DynamoDBTableName` | 装了任一应用 | 后端数据服务 |
 
-acp-proxy 的三个生成凭据同时存在 Secrets Manager：`<ProjectName><EnvironmentId>/acp-proxy/{admin-token,api-key,store-key}`（API key 为 `sk-acp-` + `api-key` 的值），Stack Update 时保持不变。
+acp-proxy 的三个生成凭据同时存在 Secrets Manager（Stack 资源 `AcpProxyAdminTokenSecret` / `AcpProxyApiKeySecret` / `AcpProxyStoreKeySecret`，名字由 CloudFormation 生成；API key 为 `sk-acp-` + `AcpProxyApiKeySecret` 的值），Stack Update 时保持不变。
 
 ---
 
@@ -271,7 +273,7 @@ kubectl get nodepool,nodeclass
 
 ### 拆栈
 
-CloudFormation → 选中 Stack → **Delete**，15–30 分钟。删除顺序已内置：acp-proxy `helm uninstall` → 删除每个 Pod 的 PVC 并等待 EBS 卷释放（避免残留卷计费）→ 删 `acp-proxy` 命名空间 / StorageClass → LiteLLM `helm uninstall` → 清理 NLB / LoadBalancer Service（避免残留 ENI 阻塞 VPC 删除）。Secrets Manager 的三个 acp-proxy 密钥按默认 7–30 天恢复窗口删除（同名重建前可 `aws secretsmanager delete-secret --force-delete-without-recovery`）。
+CloudFormation → 选中 Stack → **Delete**，15–30 分钟。删除顺序已内置：acp-proxy `helm uninstall` → 删除每个 Pod 的 PVC 并等待 EBS 卷释放（避免残留卷计费）→ 删 `acp-proxy` 命名空间 / StorageClass → LiteLLM `helm uninstall` → 清理 NLB / LoadBalancer Service（避免残留 ENI 阻塞 VPC 删除）。Secrets Manager 的三个 acp-proxy 密钥按默认恢复窗口删除；名字由 CloudFormation 生成，所以同一个 `EnvironmentId` 可以立刻重建。
 
 ---
 
