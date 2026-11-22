@@ -18,6 +18,7 @@
 所以 LiteLLM 侧的文档照常适用：[../API.md](../API.md)（LiteLLM API）、[../aws-example/](../aws-example/README.md)、[../docs/console-deployment.md](../docs/console-deployment.md)、`../scripts/e2e-test.sh`（Outputs 键名 `A1..A4` 不变）。
 
 - **Kiro 账号初始化**（acp-proxy 必读）：[kiro-init.md](kiro-init.md)
+- **不用 CloudFormation，直接 `helm install` acp-proxy**：见「八」
 
 ---
 
@@ -315,7 +316,107 @@ CloudFormation → 选中 Stack → **Delete**，15–30 分钟。删除顺序�
 
 ---
 
-## 八、故障排查（acp-proxy）
+## 八、不用 CloudFormation：直接 `helm install` acp-proxy
+
+已有 Kubernetes 集群（EKS 或其他）时，acp-proxy 可以直接用 Helm 装，CloudFormation 里的 `AcpProxyDeploy` 做的也就是这一步。
+
+### 8.1 前置条件
+
+- **Gateway API + Envoy Gateway**，以及一个 `Gateway`（chart 默认 `envoy-gateway-system/eg`，`global.gateway` / `global.gatewayNamespace` 可改）。默认路由挂在名为 **`https`** 的 listener 上，并在名为 **`http`** 的 listener 上加 HTTP→HTTPS 跳转（`gateway.listener` / `gateway.httpsRedirect` 可改，见 8.4）。
+- **linux/arm64 节点**（镜像只有 arm64）。
+- 可选依赖：Postgres（请求日志、会话亲和、控制台添加的账号持久化）、Redis（多副本必需）、OIDC 或 Basic Auth（控制台登录）。
+- Helm ≥ 3.8（OCI chart）。chart 与镜像都是公开的，不需要 `helm registry login`：
+  ```bash
+  helm show values oci://ghcr.io/aws300/charts/acp-proxy --version 0.2.0   # 全部可配置项
+  ```
+
+### 8.2 最小安装（单副本，无外部依赖）
+
+```bash
+ADMIN_TOKEN=$(openssl rand -hex 24)
+API_KEY=sk-acp-$(openssl rand -hex 20)
+
+helm install acp-proxy oci://ghcr.io/aws300/charts/acp-proxy --version 0.2.0 \
+  -n acp-proxy --create-namespace \
+  --set host=acp.example.com \
+  --set secrets.adminToken=$ADMIN_TOKEN \
+  --set secrets.storeKey=$(openssl rand -hex 32) \
+  --set "secrets.apiKeys[0]=$API_KEY" \
+  --set dependencies.auth="admin:$(openssl rand -hex 12)" \
+  --set nodeSelector."kubernetes\.io/arch"=arm64
+
+kubectl -n acp-proxy rollout status statefulset/acp-proxy
+echo "admin token: $ADMIN_TOKEN   api key: $API_KEY"
+```
+
+- 控制台：`https://acp.example.com/acp-proxy/`（浏览器弹 Basic Auth，用户名 `admin`，密码为上面 `dependencies.auth` 的冒号后部分，可 `helm get values acp-proxy -n acp-proxy` 查看）
+- API：`ANTHROPIC_BASE_URL=https://acp.example.com/acp-proxy`，`x-api-key: $API_KEY`
+- `host` 的 DNS 要指向 Gateway，TLS 证书由 Gateway 的 `https` listener 提供。
+- 不设 `dependencies.db` 时数据在内存 / Pod 本地：请求日志、控制台添加的账号在 Pod 重启后丢失，适合试用。
+- 想挂在域名根路径：`--set rootPath=""`。
+
+### 8.3 生产安装（多副本 + Postgres + Redis + OIDC + EBS）
+
+`values-prod.yaml`：
+
+```yaml
+host: acp-console.example.com        # 控制台（前端）域名；OIDC 回调 https://<host>/acp-proxy/auth/oidc/callback
+apiHost: acp-api.example.com         # 可选：API（后端）域名，控制台显示 https://<apiHost>/acp-proxy
+rootPath: /acp-proxy
+replicas: 2                          # >1 必须配置 dependencies.redis
+nodeSelector:
+  kubernetes.io/arch: arm64
+persistence:                         # 每个 Pod 一块卷保存 Kiro 登录态
+  enabled: true
+  storageClass: gp3                  # EKS Auto Mode：provisioner ebs.csi.eks.amazonaws.com 的 StorageClass
+  size: 20Gi
+dependencies:
+  # TLS Redis / ElastiCache Serverless：rediss://default:<url-encoded 密码>@<host>:6379
+  redis: "rediss://default:CHANGE_ME@my-cache.serverless.use1.cache.amazonaws.com:6379"
+  # Cognito：pre-token-generation Lambda 把组写进顶层 groups 声明，groups=admin 只放行 admin 组
+  auth: "oidc://<clientId>:<clientSecret>@cognito-idp.us-east-1.amazonaws.com/<userPoolId>?scope=openid%20profile%20email&groups=admin"
+secrets:
+  adminToken: "CHANGE_ME"            # openssl rand -hex 24
+  storeKey: "CHANGE_ME"              # openssl rand -hex 32；多副本必须一致（chart 共用一个 Secret）
+  apiKeys:
+    - "sk-acp-CHANGE_ME"
+  # Postgres DSN 放 Secret（不进 ConfigMap）；库不存在会在首次启动时自动创建
+  dbDSN: "postgres://pgadmin:CHANGE_ME@my-aurora.cluster-xxxx.us-east-1.rds.amazonaws.com:5432/acp-proxy?sslmode=require"
+```
+
+```bash
+helm upgrade --install acp-proxy oci://ghcr.io/aws300/charts/acp-proxy --version 0.2.0 \
+  -n acp-proxy --create-namespace -f values-prod.yaml
+```
+
+- 机密也可以预先建好 Secret，用 `--set secretName=<name>`；Secret 里需要 `ACP_ADMIN_TOKEN`、`KP_SECRET_KEY`、`ACP_API_KEY_0..N` 和可选的 `ACP_DB_DSN`；`secrets.apiKeys` 仍要写同样条数的占位值（ConfigMap 按条数生成 `${ACP_API_KEY_i}` 引用），用 Secret 里的 DSN 时再设 `secrets.dbDSN` 为任意非空占位。
+- OIDC 客户端需登记回调 `https://<host>/acp-proxy/auth/oidc/callback`、登出地址 `https://<host>/acp-proxy/`。
+
+### 8.4 装进本模板创建的集群 / 放在 CloudFront 后面
+
+CloudFront VPC Origin 经 Envoy 的 **HTTP** listener 回源，所以路由不能只挂 `https`，也不能做 HTTPS 跳转（否则重定向循环）。这正是 `AcpProxyDeploy` 传给 chart 的值：
+
+```yaml
+host: <CloudFront 域名>              # 例：d1234abcd.cloudfront.net（Outputs: CloudFrontDomain）
+apiHost: <GA 双栈域名>               # 例：a1b2.awsglobalaccelerator.com（Outputs: GlobalAcceleratorHost）
+gateway:
+  listener: ""                       # 挂到 Gateway 的全部 listener
+  httpsRedirect: false
+persistence: {enabled: true, storageClass: acp-proxy-gp3, size: 20Gi}
+```
+
+另外 CloudFront 需要 `/acp-proxy*` 不缓存的行为（本模板 `DeployAcpProxy=true` 时自带）。
+
+### 8.5 安装后
+
+- 加 Kiro 账号：[kiro-init.md](kiro-init.md)（把文中的 `BASE` 换成 `https://<host 或 apiHost>/acp-proxy`，`TOKEN` 换成 `secrets.adminToken`）。
+- 升级：`helm upgrade acp-proxy oci://ghcr.io/aws300/charts/acp-proxy --version <新版本> -n acp-proxy --reuse-values`。
+- `persistence.enabled` 不能在已有 release 上直接切换（StatefulSet 的 volumeClaimTemplates 不可变）：先 `kubectl -n acp-proxy delete sts acp-proxy --cascade=orphan` 再 `helm upgrade`，之后账号需重新登录。
+- 卸载：`helm uninstall acp-proxy -n acp-proxy`，然后 `kubectl -n acp-proxy delete pvc --all`（StatefulSet 的 PVC 不随 release 删除，不删会一直计费）。
+
+---
+
+## 九、故障排查（acp-proxy）
 
 | 现象 | 原因 / 处理 |
 |---|---|
