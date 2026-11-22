@@ -3,6 +3,7 @@
 一份 CloudFormation 模板，一次点击部署完整的 LiteLLM 云原生栈：VPC(IPv6 双栈) + EKS(Auto Mode, **1.37**，模板固定，不再是参数) + EnvoyGateway + CloudFront + Global Accelerator + Cognito SSO + Aurora Postgres Serverless + ElastiCache Serverless(Valkey) + DynamoDB + LiteLLM **v1.106.6**（Helm chart `litellm-helm 1.106.6`）。最近一次在 `us-west-1`（只有 2 个可用区）部署验证通过（2026-10-29），此前在 `ap-northeast-2` / `ap-southeast-1` 验证过。
 
 - **API 文档**（入口、认证、模型、接口、错误码、验证）：[API.md](API.md)
+- **LiteLLM + acp-proxy 合并版**（两个应用都可选，acp-proxy 挂在 `/acp-proxy/`，API 走 GA、控制台走 CloudFront）：[acp-proxy/README.md](acp-proxy/README.md)，含 Kiro 账号初始化 [acp-proxy/kiro-init.md](acp-proxy/kiro-init.md)
 - **接入 AWS 生态（aws-example）**：Bedrock Guardrails、Bedrock AgentCore Agent、Web Search on Amazon Bedrock、Amazon S3 Vectors 的脚本与文档：[aws-example/README.md](aws-example/README.md)
 - **端到端验证脚本**：`LITELLM_KEY=sk-... ./scripts/e2e-test.sh --stack <stack> --region <region>`
 - 面向运维的纯控制台操作手册（一键部署 / 逐项手动创建、每个 IAM 角色的完整 JSON、一键卸载与逐个卸载）见 [docs/console-deployment.md](docs/console-deployment.md)。
