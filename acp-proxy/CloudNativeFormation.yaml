@@ -165,7 +165,7 @@ Parameters:
   AcpProxyChartVersion:
     Type: String
     Description: "acp-proxy chart version (helm --version)"
-    Default: "0.2.0"
+    Default: "0.2.2"
   AcpProxyImageRepository:
     Type: String
     Description: "acp-proxy container image repository (linux/arm64)"
