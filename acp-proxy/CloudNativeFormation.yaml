@@ -165,7 +165,7 @@ Parameters:
   AcpProxyChartVersion:
     Type: String
     Description: "acp-proxy chart version (helm --version)"
-    Default: "0.2.2"
+    Default: "0.2.3"
   AcpProxyImageRepository:
     Type: String
     Description: "acp-proxy container image repository (linux/arm64)"
@@ -4370,6 +4370,9 @@ Resources:
                "replicas":int(props.get("Replicas","2")),
                "persistence":{"enabled":persist,"storageClass":props.get("StorageClass",""),"size":props.get("VolumeSize","20Gi")},
                "nodeSelector":{"kubernetes.io/arch":"arm64"},
+               # Replicas in different AZs; each EBS volume's PV node affinity then
+               # pins its pod back to that AZ on every restart.
+               "zoneSpread":True,
                "dependencies":{"db":"","redis":redis,"auth":auth},
                "secrets":{"adminToken":admin,"storeKey":store,"apiKeys":[api_key],"dbDSN":db}}
             return v,{"AdminToken":admin,"ApiKey":api_key}
@@ -4435,6 +4438,12 @@ Resources:
                 L.warning("StatefulSet spec change is forbidden; recreating it (orphan)")
                 k.req("DELETE",f"/apis/apps/v1/namespaces/{ns}/statefulsets/{release}",{"kind":"DeleteOptions","apiVersion":"v1","propagationPolicy":"Orphan"})
                 time.sleep(5);r=helm_upgrade(helm,k,props,ns,release,vf.name)
+                if r.returncode==0:
+                  # The new StatefulSet adopts the running pods but cannot update them in
+                  # place (a pod's volumes are immutable) and stalls: replace them so they
+                  # come back with the new /data (PVC or emptyDir).
+                  s,_=k.req("DELETE",f"/api/v1/namespaces/{ns}/pods?labelSelector=app%3D{release}")
+                  L.info(f"replace adopted pods: HTTP {s}");time.sleep(20)
               os.unlink(vf.name)
               L.info(f"stdout: {r.stdout[:2000]}")
               if r.returncode!=0:

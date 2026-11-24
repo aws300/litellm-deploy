@@ -5,7 +5,7 @@
 | 应用 | 参数 | 挂载路径 | 说明 |
 |---|---|---|---|
 | **LiteLLM** v1.106.6 | `DeployLiteLLM` (默认 `true`) | `/`（UI 在 `/ui/`） | Bedrock 模型的 OpenAI / Anthropic 兼容网关，虚拟 key + 预算 |
-| **acp-proxy** 0.2.2 | `DeployAcpProxy` (默认 `true`) | `/acp-proxy/` | Anthropic Messages API 兼容代理，后端是一组 Kiro 账号（`kiro-cli acp`） |
+| **acp-proxy** 0.2.3 | `DeployAcpProxy` (默认 `true`) | `/acp-proxy/` | Anthropic Messages API 兼容代理，后端是一组 Kiro 账号（`kiro-cli acp`） |
 
 **域名约定**：后端（API）域名 = **Global Accelerator** 的域名，前端（控制台 / 管理 UI）域名 = **CloudFront** 的域名。两个域名后面是同一个 EnvoyGateway，按路径分发：`/acp-proxy*` → acp-proxy，其余 → LiteLLM。
 
@@ -28,7 +28,7 @@
 - **acp-proxy 的 GHCR 包必须是 public**（部署 Lambda 匿名拉取）：
   - Helm chart：`oci://ghcr.io/aws300/charts/acp-proxy`（包名 `charts/acp-proxy`）
   - 镜像：`ghcr.io/aws300/acp-proxy-server`（linux/arm64）
-  - 自检：`helm show chart oci://ghcr.io/aws300/charts/acp-proxy --version 0.2.2`（未登录 GHCR 的机器上能拉到即可）
+  - 自检：`helm show chart oci://ghcr.io/aws300/charts/acp-proxy --version 0.2.3`（未登录 GHCR 的机器上能拉到即可）
 - **LiteLLM 需要 Bedrock 模型访问**（`DeployLiteLLM=true` 时）：Claude opus/sonnet/haiku 5.5、GLM 5.3、Kimi K3、Cohere Embed v4 走本 Region 的 `global.*` 跨区推理配置文件；GPT-6 / GPT-6.1 走 `us-east-1` 的 `bedrock-mantle`（参数 `BedrockRegion` / `BedrockMantleRegion` 可改）
   - 开通位置：AWS Console → Amazon Bedrock → **Model access** → **Modify model access** → 勾选 → **Submit**
 - **acp-proxy 需要 Kiro 订阅**：一个 IAM Identity Center 实例里有已订阅 Kiro 的用户，见 [kiro-init.md](kiro-init.md)。部署本身不需要，装完再加账号即可。
@@ -62,7 +62,7 @@
    | **`DeployLiteLLM`** | `true` / `false` | 是否装 LiteLLM |
    | **`DeployAcpProxy`** | `true` / `false` | 是否装 acp-proxy |
    | `AcpProxyChartRef` | `oci://ghcr.io/aws300/charts/acp-proxy` | 一般不改 |
-   | `AcpProxyChartVersion` | `0.2.2` | 升级 acp-proxy 时改这里再 Update stack |
+   | `AcpProxyChartVersion` | `0.2.3` | 升级 acp-proxy 时改这里再 Update stack |
    | `AcpProxyImageRepository` / `AcpProxyImageTag` | `ghcr.io/aws300/acp-proxy-server` / 空 | 空 tag = chart 的 appVersion |
    | `AcpProxyReplicas` | `2` | acp-proxy Pod 数；Kiro 账号经 Valkey 分片到各 Pod |
    | `AcpProxyPersistence` | `true` | 每个 Pod 一块 gp3 EBS 存 Kiro 登录态；`false` = Pod 重启后账号需重新登录 |
@@ -263,7 +263,7 @@ kubectl get nodepool,nodeclass
 - **EKS 版本固定 1.37**；旧模板（1.33–1.35）建的 Stack 不能直接 Update 到本模板，先在 EKS 控制台逐级升级或删除重建。
 - **不要通过 Update stack 改 EKS `ComputeConfig` / `NodePools`**。
 - 默认 5 个 NodePool；LiteLLM 与 acp-proxy 都只用 arm64 `cpu` 池（acp-proxy 镜像只有 linux/arm64，chart 里 `nodeSelector: kubernetes.io/arch: arm64`）。`g6e.2xlarge` 在 ap-southeast-1 不可用，只影响 GPU 池。
-- **Update stack 可以改的开关**：`DeployLiteLLM` / `DeployAcpProxy` 都能事后打开或关闭（关闭 = 卸载对应应用及其 Cognito 客户端；Aurora / Valkey 在两个都关时才删）。`AcpProxyChartVersion` / `AcpProxyImageTag` / `AcpProxyReplicas` 改完 Update 即 `helm upgrade`。`AcpProxyPersistence` 切换时部署 Lambda 会孤儿删除并重建 StatefulSet（volumeClaimTemplates 不可变），**切换后所有 Kiro 账号需重新登录**。
+- **Update stack 可以改的开关**：`DeployLiteLLM` / `DeployAcpProxy` 都能事后打开或关闭（关闭 = 卸载对应应用及其 Cognito 客户端；Aurora / Valkey 在两个都关时才删）。`AcpProxyChartVersion` / `AcpProxyImageTag` / `AcpProxyReplicas` 改完 Update 即 `helm upgrade`。`AcpProxyPersistence` 切换时部署 Lambda 会孤儿删除并重建 StatefulSet（volumeClaimTemplates 不可变），再替换被接管的 Pod（Pod 的卷不可原地修改），**切换后所有 Kiro 账号需重新登录**（期间服务短暂中断）。开启时每个 Pod 一块 gp3 EBS 卷；EBS 卷属于单个可用区，PV 的 node affinity 让 `acp-proxy-N` 每次重启都回到同一可用区，两个副本按可用区打散（`zoneSpread`）。
 - **首次部署失败先看 Events 页签** `CREATE_FAILED` 的 `Status reason`：多为配额 / SCP / IAM，或 Bedrock 未开通；acp-proxy 特有的是 GHCR 包未公开（见「故障排查」）。
 
 ### 已知 Bedrock 限制（LiteLLM，非模板问题）
@@ -329,7 +329,7 @@ CloudFormation → 选中 Stack → **Delete**，15–30 分钟。删除顺序�
 - 可选依赖：Postgres（请求日志、会话亲和、控制台添加的账号持久化）、Redis（多副本必需）、OIDC 或 Basic Auth（控制台登录）。
 - Helm ≥ 3.8（OCI chart）。chart 与镜像都是公开的，不需要 `helm registry login`：
   ```bash
-  helm show values oci://ghcr.io/aws300/charts/acp-proxy --version 0.2.2   # 全部可配置项
+  helm show values oci://ghcr.io/aws300/charts/acp-proxy --version 0.2.3   # 全部可配置项
   ```
 
 ### 8.2 最小安装（单副本，无外部依赖）
@@ -338,7 +338,7 @@ CloudFormation → 选中 Stack → **Delete**，15–30 分钟。删除顺序�
 ADMIN_TOKEN=$(openssl rand -hex 24)
 API_KEY=sk-acp-$(openssl rand -hex 20)
 
-helm install acp-proxy oci://ghcr.io/aws300/charts/acp-proxy --version 0.2.2 \
+helm install acp-proxy oci://ghcr.io/aws300/charts/acp-proxy --version 0.2.3 \
   -n acp-proxy --create-namespace \
   --set host=acp.example.com \
   --set secrets.adminToken=$ADMIN_TOKEN \
@@ -387,7 +387,7 @@ secrets:
 ```
 
 ```bash
-helm upgrade --install acp-proxy oci://ghcr.io/aws300/charts/acp-proxy --version 0.2.2 \
+helm upgrade --install acp-proxy oci://ghcr.io/aws300/charts/acp-proxy --version 0.2.3 \
   -n acp-proxy --create-namespace -f values-prod.yaml
 ```
 
